@@ -73,9 +73,44 @@ if TYPE_CHECKING:
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
 
+# Track if profiling is active to disable CUDA graph replay during profiling
+# CUDA graph replay is incompatible with profiling tools (torch.profiler, nsys, etc.)
+# because profiling tools change the CUDA execution environment
+_profiling_active = False
+
 
 def get_is_capture_mode():
     return is_capture_mode
+
+
+def set_profiling_active(active: bool):
+    """Set the profiling active state. Called by scheduler when profiling starts/stops."""
+    global _profiling_active
+    _profiling_active = active
+
+
+def is_profiling_active():
+    """
+    Check if CUDA profiling is currently active.
+    CUDA graph replay is incompatible with profiling tools (torch.profiler, nsys, etc.)
+    because profiling tools change the CUDA execution environment.
+    """
+    global _profiling_active
+    
+    # Check global flag set by scheduler
+    if _profiling_active:
+        return True
+    
+    # Check environment variables that profiling tools set
+    # nsys sets NSYS_PROFILE=1
+    if os.getenv("NSYS_PROFILE") == "1":
+        return True
+    
+    # Check if running under nsys (nsys sets this env var)
+    if os.getenv("NSYS_NVTXM_ENABLED") == "1":
+        return True
+    
+    return False
 
 
 @contextmanager
@@ -373,6 +408,12 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        # Disable CUDA graph replay during profiling to avoid conflicts
+        # CUDA graph replay is incompatible with profiling tools (torch.profiler, nsys, etc.)
+        # because profiling tools change the CUDA execution environment
+        if is_profiling_active():
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs

@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
+from sglang.srt.model_executor.cuda_graph_runner import set_profiling_active
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_npu
 
@@ -143,6 +144,8 @@ class SchedulerProfilerMixin:
             self.rpd_profiler.start()
             self.rpd_profiler.rangePush("", "rpd profile range", "")
             self.profile_in_progress = True
+            # Disable CUDA graph replay during profiling
+            set_profiling_active(True)
         elif torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
@@ -166,6 +169,11 @@ class SchedulerProfilerMixin:
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
+
+        # Disable CUDA graph replay during profiling to avoid conflicts
+        # CUDA graph replay is incompatible with profiling tools
+        if self.profile_in_progress:
+            set_profiling_active(True)
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
@@ -231,6 +239,9 @@ class SchedulerProfilerMixin:
         self.torch_profiler = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
+
+        # Re-enable CUDA graph replay after profiling stops
+        set_profiling_active(False)
 
         return ProfileReqOutput(success=True, message="Succeeded.")
 
