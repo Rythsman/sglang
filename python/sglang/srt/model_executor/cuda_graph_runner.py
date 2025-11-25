@@ -426,12 +426,16 @@ class CudaGraphRunner:
             else True
         )
 
+        # Disable CUDA graph during profiling to avoid conflicts
+        is_profile_compatible = not self.model_runner.profile_in_progress
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_profile_compatible
         )
 
     def capture(self) -> None:

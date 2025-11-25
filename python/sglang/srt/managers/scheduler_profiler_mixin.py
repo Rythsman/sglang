@@ -167,6 +167,9 @@ class SchedulerProfilerMixin:
             torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
+        # Disable CUDA graph during profiling to avoid conflicts
+        self._set_model_runner_profile_state(True)
+
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def stop_profile(
@@ -232,7 +235,16 @@ class SchedulerProfilerMixin:
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
+        # Re-enable CUDA graph after profiling ends
+        self._set_model_runner_profile_state(False)
+
         return ProfileReqOutput(success=True, message="Succeeded.")
+
+    def _set_model_runner_profile_state(self, profile_in_progress: bool):
+        """Set the profiling state on the model runner to control CUDA graph usage."""
+        if hasattr(self, "tp_worker") and self.tp_worker is not None:
+            if hasattr(self.tp_worker, "model_runner"):
+                self.tp_worker.model_runner.profile_in_progress = profile_in_progress
 
     def _profile_batch_predicate(self, batch):
         if self.profile_by_stage:

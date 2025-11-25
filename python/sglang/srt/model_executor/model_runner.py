@@ -472,6 +472,9 @@ class ModelRunner:
 
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
+        # Profiling state: when True, CUDA graph will be disabled to avoid conflicts
+        self.profile_in_progress = False
+
     def model_specific_adjustment(self):
         server_args = self.server_args
 
