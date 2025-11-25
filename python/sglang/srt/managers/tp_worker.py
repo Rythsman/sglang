@@ -228,6 +228,9 @@ class TpModelWorker:
             self.model_runner.token_to_kv_pool_allocator,
         )
 
+    def set_runtime_disable_cuda_graph(self, disabled: bool):
+        self.model_runner.set_runtime_disable_cuda_graph(disabled)
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,

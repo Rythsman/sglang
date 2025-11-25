@@ -258,6 +258,7 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+        self.runtime_disable_cuda_graph = False
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -1856,6 +1857,13 @@ class ModelRunner:
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
+    def set_runtime_disable_cuda_graph(self, disabled: bool):
+        if disabled == self.runtime_disable_cuda_graph:
+            return
+        self.runtime_disable_cuda_graph = disabled
+        state = "disabled" if disabled else "enabled"
+        logger.info("Runtime cuda graph is %s.", state)
+
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
         cpu_ids_by_node = get_cpu_ids_by_node()
@@ -2016,6 +2024,7 @@ class ModelRunner:
         can_run_graph = bool(
             mode_check()
             and self.graph_runner
+            and not self.runtime_disable_cuda_graph
             and self.graph_runner.can_run(forward_batch)
         )
 

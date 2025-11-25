@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.distributed.parallel_state import get_dcp_size_from_env
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -41,6 +42,7 @@ class SchedulerProfilerMixin:
         self.profile_steps: Optional[int] = None
         self.profile_in_progress: bool = False
         self.rpd_profiler = None
+        self._cuda_graph_disabled_for_profile = False
 
     def init_profile(
         self,
@@ -167,6 +169,7 @@ class SchedulerProfilerMixin:
             torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
+        self._maybe_toggle_cuda_graph_for_profile(True)
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def stop_profile(
@@ -232,7 +235,46 @@ class SchedulerProfilerMixin:
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
+        self._maybe_toggle_cuda_graph_for_profile(False)
+
         return ProfileReqOutput(success=True, message="Succeeded.")
+
+    def _apply_runtime_cuda_graph_state(self, disabled: bool):
+        workers = []
+        tp_worker = getattr(self, "tp_worker", None)
+        if tp_worker is not None:
+            workers.append(tp_worker)
+        draft_worker = getattr(self, "draft_worker", None)
+        if draft_worker is not None:
+            workers.append(draft_worker)
+
+        for worker in workers:
+            setter = getattr(worker, "set_runtime_disable_cuda_graph", None)
+            if setter is not None:
+                setter(disabled)
+
+    def _should_disable_cuda_graph_for_profile(self) -> bool:
+        return (
+            get_dcp_size_from_env() > 1
+            and hasattr(self, "server_args")
+            and not getattr(self.server_args, "disable_cuda_graph", False)
+        )
+
+    def _maybe_toggle_cuda_graph_for_profile(self, disable: bool):
+        if disable:
+            if self._cuda_graph_disabled_for_profile:
+                return
+            if not self._should_disable_cuda_graph_for_profile():
+                return
+            self._apply_runtime_cuda_graph_state(True)
+            self._cuda_graph_disabled_for_profile = True
+            logger.info("DCP profiling: temporarily disable cuda graph replay.")
+        else:
+            if not self._cuda_graph_disabled_for_profile:
+                return
+            self._apply_runtime_cuda_graph_state(False)
+            self._cuda_graph_disabled_for_profile = False
+            logger.info("DCP profiling: re-enable cuda graph replay.")
 
     def _profile_batch_predicate(self, batch):
         if self.profile_by_stage:
