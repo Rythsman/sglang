@@ -299,6 +299,9 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # Disable CUDA graph when profiling is in progress
+    disable_cuda_graph_for_profiling: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -340,6 +343,7 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            disable_cuda_graph_for_profiling=batch.disable_cuda_graph_for_profiling,
         )
         device = model_runner.device
 

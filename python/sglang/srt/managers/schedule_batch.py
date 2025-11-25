@@ -954,6 +954,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
+    # Disable CUDA graph when profiling is in progress
+    disable_cuda_graph_for_profiling: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -1942,6 +1945,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
+            disable_cuda_graph_for_profiling=self.disable_cuda_graph_for_profiling,
         )
 
     def copy(self):
@@ -1959,6 +1963,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
+            disable_cuda_graph_for_profiling=self.disable_cuda_graph_for_profiling,
         )
 
     def _evict_tree_cache_if_needed(self, num_tokens: int):
@@ -2086,6 +2091,9 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    # Disable CUDA graph when profiling is in progress
+    disable_cuda_graph_for_profiling: bool = False
 
 
 @triton.jit

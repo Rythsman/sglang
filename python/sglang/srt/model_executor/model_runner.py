@@ -2017,6 +2017,7 @@ class ModelRunner:
             mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
+            and not forward_batch.disable_cuda_graph_for_profiling
         )
 
         if can_run_graph:

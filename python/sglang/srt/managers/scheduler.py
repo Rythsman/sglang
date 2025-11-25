@@ -2000,6 +2000,9 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        # Disable CUDA graph when profiling is in progress
+        new_batch.disable_cuda_graph_for_profiling = self.profile_in_progress
+
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
@@ -2064,6 +2067,10 @@ class Scheduler(
 
         # Update batch tensors
         batch.prepare_for_decode()
+
+        # Disable CUDA graph when profiling is in progress
+        batch.disable_cuda_graph_for_profiling = self.profile_in_progress
+
         return batch
 
     def run_batch(
@@ -2376,6 +2383,10 @@ class Scheduler(
             self.spec_algorithm,
         )
         idle_batch.prepare_for_idle()
+
+        # Disable CUDA graph when profiling is in progress
+        idle_batch.disable_cuda_graph_for_profiling = self.profile_in_progress
+
         return idle_batch
 
     def move_ready_grammar_requests(self):
