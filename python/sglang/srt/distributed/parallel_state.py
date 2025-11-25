@@ -1405,7 +1405,12 @@ def graph_capture():
     with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
         context
     ):
-        yield context
+        # Include DCP group in graph capture context if DCP is enabled
+        if _DCP is not None and _DCP.world_size > 1:
+            with _DCP.graph_capture(context):
+                yield context
+        else:
+            yield context
 
 
 logger = logging.getLogger(__name__)
