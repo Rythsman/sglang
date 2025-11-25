@@ -58,6 +58,12 @@ class NGRAMWorker:
     def clear_cache_pool(self):
         self.ngram_cache.reset()
 
+    def set_runtime_disable_cuda_graph(self, disabled: bool):
+        """Forward cuda graph runtime toggles to the target worker."""
+        setter = getattr(self.target_worker, "set_runtime_disable_cuda_graph", None)
+        if setter is not None:
+            setter(disabled)
+
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
         seq2_len = len(seq2)
         if seq2_len >= n:

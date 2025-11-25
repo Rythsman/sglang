@@ -258,6 +258,7 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+        self.cuda_graph_runtime_disabled = False
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -1856,6 +1857,14 @@ class ModelRunner:
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
+    def set_runtime_disable_cuda_graph(self, disabled: bool):
+        """Temporarily toggle cuda graph replay without rebuilding the graphs."""
+        if self.cuda_graph_runtime_disabled == disabled:
+            return
+        state = "disabled" if disabled else "enabled"
+        logger.info("Runtime cuda graph %s due to profiling request.", state)
+        self.cuda_graph_runtime_disabled = disabled
+
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
         cpu_ids_by_node = get_cpu_ids_by_node()
@@ -2014,7 +2023,8 @@ class ModelRunner:
             else forward_batch.forward_mode.is_cuda_graph
         )
         can_run_graph = bool(
-            mode_check()
+            (not self.cuda_graph_runtime_disabled)
+            and mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )

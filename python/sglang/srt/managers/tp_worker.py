@@ -180,6 +180,10 @@ class TpModelWorker:
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
+    def set_runtime_disable_cuda_graph(self, disabled: bool):
+        """Propagate runtime cuda graph toggles to the underlying model runner."""
+        self.model_runner.set_runtime_disable_cuda_graph(disabled)
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,

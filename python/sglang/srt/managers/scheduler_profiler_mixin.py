@@ -41,6 +41,7 @@ class SchedulerProfilerMixin:
         self.profile_steps: Optional[int] = None
         self.profile_in_progress: bool = False
         self.rpd_profiler = None
+        self.cuda_graph_disabled_by_profiler: bool = False
 
     def init_profile(
         self,
@@ -167,6 +168,9 @@ class SchedulerProfilerMixin:
             torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
+        if self.profile_in_progress:
+            self._set_profiler_cuda_graph_state(True)
+
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def stop_profile(
@@ -231,8 +235,42 @@ class SchedulerProfilerMixin:
         self.torch_profiler = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
+        self._set_profiler_cuda_graph_state(False)
 
         return ProfileReqOutput(success=True, message="Succeeded.")
+
+    def _set_profiler_cuda_graph_state(self, disabled: bool):
+        """Toggle cuda graph replay while profiling is active."""
+        if disabled == self.cuda_graph_disabled_by_profiler:
+            return
+
+        workers = []
+        for attr in ("tp_worker", "draft_worker", "model_worker"):
+            worker = getattr(self, attr, None)
+            if worker is not None:
+                workers.append(worker)
+
+        seen = set()
+        applied = False
+        for worker in workers:
+            if id(worker) in seen:
+                continue
+            setter = getattr(worker, "set_runtime_disable_cuda_graph", None)
+            if setter is None:
+                continue
+            setter(disabled)
+            seen.add(id(worker))
+            applied = True
+
+        self.cuda_graph_disabled_by_profiler = disabled
+
+        if applied:
+            state = "disabled" if disabled else "re-enabled"
+            logger.info(
+                "%s cuda graph while profiling %s.",
+                state.capitalize(),
+                "is active" if disabled else "has finished",
+            )
 
     def _profile_batch_predicate(self, batch):
         if self.profile_by_stage:
