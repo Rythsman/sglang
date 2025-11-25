@@ -383,6 +383,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 decode_wrapper=decode_wrapper,
                 init_metadata_replay=False,
                 spec_info=spec_info,
+                kv_indices=self.cuda_graph_kv_indices,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrapper
             self.forward_metadata = DecodeMetadata(decode_wrapper)
@@ -709,11 +710,17 @@ class FlashInferMLAIndicesUpdaterDecode:
         if spec_info is None:
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = (
-                torch.empty(paged_kernel_lens_sum, dtype=torch.int32, device="cuda")
-                if not init_metadata_replay
-                else fast_decode_kwargs["kv_indices"]
-            )
+
+            # Use provided kv_indices buffer if available (for CUDA Graph Capture/Replay)
+            if "kv_indices" in fast_decode_kwargs:
+                kv_indices = fast_decode_kwargs["kv_indices"]
+            elif init_metadata_replay:
+                kv_indices = fast_decode_kwargs["kv_indices"]
+            else:
+                kv_indices = torch.empty(
+                    paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+                )
+
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
@@ -754,8 +761,8 @@ class FlashInferMLAIndicesUpdaterDecode:
                 filtered_paged_kernel_lens, filterd_kv_indices = filter_seq_indices(
                     paged_kernel_lens, kv_indptr, get_dcp_rank(), get_dcp_world_size()
                 )
-                if init_metadata_replay:
-                    # For cuda graph replay, we must pack the DCP-filtered indices
+                if init_metadata_replay or "kv_indices" in fast_decode_kwargs:
+                    # For cuda graph capture and replay, we must pack the DCP-filtered indices
                     # back into the shared kv_indices buffer so that the FlashInfer
                     # kernel reads a contiguous prefix of valid entries.
                     local_kv_indices = kv_indices[filterd_kv_indices]
