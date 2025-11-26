@@ -1234,19 +1234,22 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
 
+        # Avoid using .all() or .any() which trigger CUDA synchronization and can cause hang with large batch sizes.
+        # In DCP mode, loc contains -1 values for tokens not belonging to this rank.
+        # We always filter to handle this case without checking, which avoids synchronization.
+        # PyTorch advanced indexing handles empty filtered tensors gracefully (no-op).
         valid_mask = loc >= 0
-        if not valid_mask.all():
-            loc = loc[valid_mask]
-            cache_k = cache_k[valid_mask]
-
-        if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
+        filtered_loc = loc[valid_mask]
+        filtered_cache_k = cache_k[valid_mask]
+        
+        if filtered_cache_k.dtype != self.dtype:
+            filtered_cache_k = filtered_cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+            self.kv_buffer[layer_id - self.start_layer][filtered_loc] = filtered_cache_k.view(
                 self.store_dtype
             )
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.kv_buffer[layer_id - self.start_layer][filtered_loc] = filtered_cache_k
 
     def set_mla_kv_buffer(
         self,
