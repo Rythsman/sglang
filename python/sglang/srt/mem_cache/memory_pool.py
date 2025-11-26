@@ -1235,18 +1235,22 @@ class MLATokenToKVPool(KVCache):
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
 
         valid_mask = loc >= 0
-        if not valid_mask.all():
-            loc = loc[valid_mask]
-            cache_k = cache_k[valid_mask]
+        # Avoid using valid_mask.all() which is a synchronous operation that can hang
+        # with large batch sizes in DCP mode. Instead, directly filter using masked indexing.
+        # This avoids the synchronous all() check while still filtering invalid entries.
+        # If all entries are valid, this is a no-op (returns view). If some are invalid,
+        # this filters them out efficiently without blocking synchronization.
+        loc_filtered = loc[valid_mask]
+        cache_k_filtered = cache_k[valid_mask]
 
-        if cache_k.dtype != self.dtype:
-            cache_k = cache_k.to(self.dtype)
+        if cache_k_filtered.dtype != self.dtype:
+            cache_k_filtered = cache_k_filtered.to(self.dtype)
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+            self.kv_buffer[layer_id - self.start_layer][loc_filtered] = cache_k_filtered.view(
                 self.store_dtype
             )
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.kv_buffer[layer_id - self.start_layer][loc_filtered] = cache_k_filtered
 
     def set_mla_kv_buffer(
         self,
