@@ -1235,9 +1235,17 @@ class MLATokenToKVPool(KVCache):
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
 
         valid_mask = loc >= 0
-        if not valid_mask.all():
-            loc = loc[valid_mask]
-            cache_k = cache_k[valid_mask]
+        num_valid = int(valid_mask.sum().item())
+        if num_valid == 0:
+            return
+        if num_valid < loc.numel():
+            # Only keep tokens that belong to this DCP rank to avoid unnecessary
+            # device work when the majority are filtered out.
+            valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+            loc = torch.index_select(loc, 0, valid_indices)
+            cache_k = torch.index_select(cache_k, 0, valid_indices)
+            if cache_v is not None:
+                cache_v = torch.index_select(cache_v, 0, valid_indices)
 
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
