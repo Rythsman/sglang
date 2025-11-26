@@ -1040,6 +1040,61 @@ class AscendTokenToKVPool(MHATokenToKVPool):
 
 
 @triton.jit
+def set_kv_buffer_kernel(
+    kv_buffer_ptr,
+    cache_k_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    cache_stride: tl.constexpr,
+    kv_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """
+    Triton kernel for set_kv_buffer that handles negative loc values efficiently
+    without requiring CUDA synchronization.
+    """
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    mask = offs < kv_dim
+
+    loc = tl.load(loc_ptr + pid_loc)
+    is_valid = loc >= 0
+    safe_loc = tl.where(is_valid, loc, 0)
+    dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
+
+    src = tl.load(cache_k_ptr + pid_loc * cache_stride + offs, mask=mask)
+    tl.store(dst_ptr, src, mask=mask & is_valid)
+
+
+def set_kv_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k: torch.Tensor,
+):
+    """
+    Set kv buffer using triton kernel to avoid CUDA synchronization
+    when filtering negative loc values (used in DCP mode).
+    """
+    kv_dim = cache_k.shape[-1]
+    BLOCK = 128
+    n_loc = loc.numel()
+    grid = (n_loc, triton.cdiv(kv_dim, BLOCK))
+
+    set_kv_buffer_kernel[grid](
+        kv_buffer,
+        cache_k,
+        loc,
+        kv_buffer.stride(0),
+        cache_k.stride(0),
+        kv_dim,
+        BLOCK=BLOCK,
+    )
+
+
+@triton.jit
 def set_mla_kv_buffer_kernel(
     kv_buffer_ptr,
     cache_k_nope_ptr,
@@ -1234,19 +1289,18 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
 
-        valid_mask = loc >= 0
-        if not valid_mask.all():
-            loc = loc[valid_mask]
-            cache_k = cache_k[valid_mask]
-
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
-                self.store_dtype
-            )
-        else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            cache_k = cache_k.view(self.store_dtype)
+
+        # Use triton kernel to avoid CUDA synchronization when filtering
+        # negative loc values (used in DCP mode with large batch sizes)
+        set_kv_buffer_triton(
+            self.kv_buffer[layer_id - self.start_layer],
+            loc,
+            cache_k,
+        )
 
     def set_mla_kv_buffer(
         self,
@@ -1263,7 +1317,13 @@ class MLATokenToKVPool(KVCache):
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
             cache_k = quantize_k_cache(cache_k.unsqueeze(1)).squeeze(1)
             cache_k = cache_k.view(self.store_dtype)
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            # Use triton kernel to avoid CUDA synchronization when filtering
+            # negative loc values (used in DCP mode with large batch sizes)
+            set_kv_buffer_triton(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k,
+            )
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
