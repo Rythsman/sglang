@@ -696,17 +696,49 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if get_is_capture_mode() and self.alt_stream is not None:
-            # Overlap the copy of K and V cache for small batch size
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-            current_stream.wait_stream(self.alt_stream)
+        # Chunk the operation to avoid hang with large batch size
+        chunk_size = self.cpu_offloading_chunk_size
+        num_tokens = len(loc)
+        if num_tokens > chunk_size:
+            k_buffer = self.k_buffer[layer_id - self.start_layer]
+            v_buffer = self.v_buffer[layer_id - self.start_layer]
+            if get_is_capture_mode() and self.alt_stream is not None:
+                # Overlap the copy of K and V cache for small batch size
+                current_stream = self.device_module.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                for i in range(0, num_tokens, chunk_size):
+                    end_idx = min(i + chunk_size, num_tokens)
+                    chunk_loc = loc[i:end_idx]
+                    chunk_cache_k = cache_k[i:end_idx]
+                    chunk_cache_v = cache_v[i:end_idx]
+                    k_buffer[chunk_loc] = chunk_cache_k
+                with self.device_module.stream(self.alt_stream):
+                    for i in range(0, num_tokens, chunk_size):
+                        end_idx = min(i + chunk_size, num_tokens)
+                        chunk_loc = loc[i:end_idx]
+                        chunk_cache_v = cache_v[i:end_idx]
+                        v_buffer[chunk_loc] = chunk_cache_v
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                for i in range(0, num_tokens, chunk_size):
+                    end_idx = min(i + chunk_size, num_tokens)
+                    chunk_loc = loc[i:end_idx]
+                    chunk_cache_k = cache_k[i:end_idx]
+                    chunk_cache_v = cache_v[i:end_idx]
+                    k_buffer[chunk_loc] = chunk_cache_k
+                    v_buffer[chunk_loc] = chunk_cache_v
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            if get_is_capture_mode() and self.alt_stream is not None:
+                # Overlap the copy of K and V cache for small batch size
+                current_stream = self.device_module.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                with self.device_module.stream(self.alt_stream):
+                    self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         N = tgt_loc.numel()
@@ -1241,12 +1273,32 @@ class MLATokenToKVPool(KVCache):
 
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
-        if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
-                self.store_dtype
-            )
+
+        # Chunk the operation to avoid hang with large batch size
+        # Use the same chunk size as cpu_offloading for consistency
+        chunk_size = self.cpu_offloading_chunk_size
+        num_tokens = len(loc)
+        if num_tokens > chunk_size:
+            target_buffer = self.kv_buffer[layer_id - self.start_layer]
+            if self.store_dtype != self.dtype:
+                for i in range(0, num_tokens, chunk_size):
+                    end_idx = min(i + chunk_size, num_tokens)
+                    chunk_loc = loc[i:end_idx]
+                    chunk_cache_k = cache_k[i:end_idx]
+                    target_buffer[chunk_loc] = chunk_cache_k.view(self.store_dtype)
+            else:
+                for i in range(0, num_tokens, chunk_size):
+                    end_idx = min(i + chunk_size, num_tokens)
+                    chunk_loc = loc[i:end_idx]
+                    chunk_cache_k = cache_k[i:end_idx]
+                    target_buffer[chunk_loc] = chunk_cache_k
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            if self.store_dtype != self.dtype:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                    self.store_dtype
+                )
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
     def set_mla_kv_buffer(
         self,
@@ -1263,7 +1315,18 @@ class MLATokenToKVPool(KVCache):
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
             cache_k = quantize_k_cache(cache_k.unsqueeze(1)).squeeze(1)
             cache_k = cache_k.view(self.store_dtype)
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            # Chunk the operation to avoid hang with large batch size
+            chunk_size = self.cpu_offloading_chunk_size
+            num_tokens = len(loc)
+            if num_tokens > chunk_size:
+                target_buffer = self.kv_buffer[layer_id - self.start_layer]
+                for i in range(0, num_tokens, chunk_size):
+                    end_idx = min(i + chunk_size, num_tokens)
+                    chunk_loc = loc[i:end_idx]
+                    chunk_cache_k = cache_k[i:end_idx]
+                    target_buffer[chunk_loc] = chunk_cache_k
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
@@ -1682,9 +1745,26 @@ class DoubleSparseTokenToKVPool(KVCache):
     ):
         # NOTE(Andy): ignore the dtype check
         layer_id = layer.layer_id
-        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-        self.label_buffer[layer_id - self.start_layer][loc] = cache_label
+        # Chunk the operation to avoid hang with large batch size
+        chunk_size = self.cpu_offloading_chunk_size
+        num_tokens = len(loc)
+        if num_tokens > chunk_size:
+            k_buffer = self.k_buffer[layer_id - self.start_layer]
+            v_buffer = self.v_buffer[layer_id - self.start_layer]
+            label_buffer = self.label_buffer[layer_id - self.start_layer]
+            for i in range(0, num_tokens, chunk_size):
+                end_idx = min(i + chunk_size, num_tokens)
+                chunk_loc = loc[i:end_idx]
+                chunk_cache_k = cache_k[i:end_idx]
+                chunk_cache_v = cache_v[i:end_idx]
+                chunk_cache_label = cache_label[i:end_idx]
+                k_buffer[chunk_loc] = chunk_cache_k
+                v_buffer[chunk_loc] = chunk_cache_v
+                label_buffer[chunk_loc] = chunk_cache_label
+        else:
+            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            self.label_buffer[layer_id - self.start_layer][loc] = cache_label
 
 
 @triton.jit
