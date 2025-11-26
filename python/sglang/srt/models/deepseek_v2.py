@@ -300,9 +300,11 @@ def _handle_attention_backend(
     disable_ragged = (
         backend_name in ["flashinfer", "flashmla"]
     ) and attn.flashinfer_mla_disable_ragged
+    dcp_enabled = get_dcp_world_size() > 1
 
     if (
         not disable_ragged
+        and not dcp_enabled
         and _is_extend_without_speculative(forward_batch)
         and (
             (
@@ -335,13 +337,18 @@ def handle_attention_cutlass_mla(attn, forward_batch):
 
 def handle_attention_fa4(attn, forward_batch):
     # TODO(cicirori): use FA4 MHA for DeepSeekV3 for now
+    if get_dcp_world_size() > 1:
+        return AttnForwardMethod.MHA
     return AttnForwardMethod.MHA_CHUNKED_KV
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
-    if _is_extend_without_speculative(forward_batch) and (
-        not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0
+    dcp_enabled = get_dcp_world_size() > 1
+    if (
+        not dcp_enabled
+        and _is_extend_without_speculative(forward_batch)
+        and (not attn.disable_chunked_prefix_cache or sum_extend_prefix_lens == 0)
     ):
         return AttnForwardMethod.MHA_CHUNKED_KV
     else:
