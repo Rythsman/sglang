@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from python.sglang.srt.utils.hf_transformers_utils import name
-
 """
 Copyright 2025 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");

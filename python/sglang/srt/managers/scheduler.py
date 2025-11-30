@@ -362,7 +362,7 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
-        self.page_size = server_args.page_size if get_dcp_world_size() <= 1 else server_args.page_size * get_dcp_world_size()
+        self.page_size = server_args.page_size
 
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -730,7 +730,7 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
-
+        self.page_size = self.page_size * get_dcp_world_size()
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache

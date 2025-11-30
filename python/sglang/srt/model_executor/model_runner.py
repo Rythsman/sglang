@@ -96,13 +96,13 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
+    DCPPagedTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
-    DCPPagedTokenToKVPoolAllocator,
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
@@ -1510,8 +1510,6 @@ class ModelRunner:
 
         dcp_world_size = get_dcp_world_size()
         dcp_rank = get_dcp_rank()
-        if dcp_world_size > 1:
-            self.max_total_num_tokens = self.max_total_num_tokens * dcp_world_size
         # different pp rank may have different num of layers, so we need to reduce the max_total_num_tokens
         if self.pp_size > 1:
             tensor = torch.tensor(self.max_total_num_tokens, dtype=torch.int64)
@@ -1724,6 +1722,7 @@ class ModelRunner:
                             need_sort=need_sort,
                         )
                     else:
+                        self.max_total_num_tokens = self.max_total_num_tokens * dcp_world_size
                         if dcp_world_size > 1:
                             self.token_to_kv_pool_allocator = DCPPagedTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
@@ -1744,6 +1743,7 @@ class ModelRunner:
                                 need_sort=need_sort,
                             )
                 else:
+                    self.max_total_num_tokens = self.max_total_num_tokens * dcp_world_size
                     assert not self.is_hybrid
                     if dcp_world_size > 1:
                         self.token_to_kv_pool_allocator = DCPPagedTokenToKVPoolAllocator(
