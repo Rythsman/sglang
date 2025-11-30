@@ -44,6 +44,7 @@ import triton.language as tl
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu, next_power_of_2
+from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -1051,6 +1052,8 @@ def set_mla_kv_buffer_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
@@ -1061,8 +1064,8 @@ def set_mla_kv_buffer_kernel(
     mask = offs < total_dim
 
     loc = tl.load(loc_ptr + pid_loc)
-    is_valid = loc >= 0
-    safe_loc = tl.where(is_valid, loc, 0)
+    is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
+    safe_loc = tl.where(is_valid, loc // DCP_WORLD_SIZE, 0)
     dst_ptr = kv_buffer_ptr + safe_loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
@@ -1104,6 +1107,8 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        DCP_RANK=get_dcp_rank(),
+        DCP_WORLD_SIZE=get_dcp_world_size(),
     )
 
 
@@ -1234,7 +1239,7 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
 
-        valid_mask = loc >= 0
+        valid_mask = loc % get_dcp_world_size() == get_dcp_rank()
         if not valid_mask.all():
             loc = loc[valid_mask]
             cache_k = cache_k[valid_mask]

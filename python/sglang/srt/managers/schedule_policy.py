@@ -29,14 +29,6 @@ from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.distributed.parallel_state import get_dcp_world_size
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.distributed import get_tp_group
-
-def compute_dcp_local_max_new_tokens(tokens: int):
-    # return (tokens + get_dcp_world_size() -1) // get_dcp_world_size()
-    return tokens
-
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -353,7 +345,6 @@ class PrefillAdder:
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
-        self.dcp_world_size = get_dcp_world_size()
 
         if running_batch is not None:
             self.rem_total_token_offset += sum(
@@ -371,88 +362,48 @@ class PrefillAdder:
             priority_scheduling_preemption_threshold
         )
 
-        self.global_available_tokens = None
-        if self.dcp_world_size > 1:
-            if self.is_hybrid:
-                local_available = min(
-                    self.token_to_kv_pool_allocator.full_available_size()
-                    + self.tree_cache.full_evictable_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size()
-                    + self.tree_cache.swa_evictable_size(),
-                )
-            else:
-                local_available = (
-                    self.token_to_kv_pool_allocator.available_size()
-                    + self.tree_cache.evictable_size()
-                )
-            try:
-                tp_group = get_tp_group()
-                device = getattr(self.token_to_kv_pool_allocator, "device", None)
-                if device is not None:
-                    t = torch.tensor(
-                        [float(local_available)],
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                    gatherd = tp_group.all_gather(t, dim=0)
-                    self.global_available_tokens = float(gatherd.min().item())
-                else:
-                    self.global_available_tokens = float(local_available)
-            except Exception:
-                self.global_available_tokens = float(local_available)
-
-    def _scale_by_dcp(self, tokens: float) -> float:
-        if self.dcp_world_size > 1:
-            return tokens / float(self.dcp_world_size)
-        return tokens
-
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        global_tokens = (
+        return (
             min(
-                compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens - len(req.output_ids)),
+                (req.sampling_params.max_new_tokens - len(req.output_ids)),
                 CLIP_MAX_NEW_TOKENS,
             )
             * self.new_token_ratio
         )
-        return self._scale_by_dcp(global_tokens)
 
     @property
     def rem_total_tokens(self):
-        if self.dcp_world_size <= 1 or self.global_available_tokens is None:
-            if self.is_hybrid:
-                available_and_evictable = min(
-                    self.token_to_kv_pool_allocator.full_available_size()
-                    + self.tree_cache.full_evictable_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size()
-                    + self.tree_cache.swa_evictable_size(),
-                )
-            else:
-                available_and_evictable = (
-                    self.token_to_kv_pool_allocator.available_size()
-                    + self.tree_cache.evictable_size()
-                )
+        if self.is_hybrid:
+            available_and_evictable = min(
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size(),
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size(),
+            )
+        else:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
 
-            return available_and_evictable - self.rem_total_token_offset
-        return self.global_available_tokens - self.rem_total_token_offset
+        return available_and_evictable - self.rem_total_token_offset
 
     @property
     def cur_rem_tokens(self):
-        if self.dcp_world_size <= 1 or self.global_available_tokens is None:
-            if self.is_hybrid:
-                available_and_evictable = min(
-                    self.token_to_kv_pool_allocator.full_available_size()
-                    + self.tree_cache.full_evictable_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size()
-                    + self.tree_cache.swa_evictable_size(),
-                )
-            else:
-                available_and_evictable = (
-                    self.token_to_kv_pool_allocator.available_size()
-                    + self.tree_cache.evictable_size()
-                )
+        if self.is_hybrid:
+            available_and_evictable = min(
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size(),
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size(),
+            )
+        else:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
 
-            return available_and_evictable - self.cur_rem_token_offset
-        return self.global_available_tokens - self.cur_rem_token_offset
+        return available_and_evictable - self.cur_rem_token_offset
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -474,14 +425,11 @@ class PrefillAdder:
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
-        scaled_extend = self._scale_by_dcp(extend_input_len)
-        scaled_max_new = self._scale_by_dcp(max_new_tokens)
-
-        self.rem_total_token_offset += scaled_extend + scaled_max_new
-        self.cur_rem_token_offset += scaled_extend
-        self.rem_input_tokens -= scaled_extend
+        self.rem_total_token_offset += extend_input_len + max_new_tokens
+        self.cur_rem_token_offset += extend_input_len
+        self.rem_input_tokens -= extend_input_len
         if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= scaled_extend
+            self.rem_chunk_tokens -= extend_input_len
 
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
@@ -496,7 +444,7 @@ class PrefillAdder:
             0,
             req.extend_input_len,
             (
-                min(compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens), CLIP_MAX_NEW_TOKENS)
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
                 if not truncated
                 else 0
             ),
@@ -531,7 +479,7 @@ class PrefillAdder:
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
             )
-            tokens_left = compute_dcp_local_max_new_tokens(r.sampling_params.max_new_tokens) * new_token_ratio - len(
+            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
                 r.output_ids
             )
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
@@ -585,7 +533,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
-                min(compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens), CLIP_MAX_NEW_TOKENS),
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
         else:
             if self.rem_chunk_tokens == 0:
@@ -605,18 +553,11 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
-        #tp_rank = get_tensor_model_parallel_rank()
-        #print(
-        #    f"[TP{tp_rank}] PrefillAdder.add_one_req ENTER: "
-        #    f"rid={req.rid}, extend_input_len={req.extend_input_len}, "
-        #    f"rem_total_tokens={self.rem_total_tokens}, rem_input_tokens={self.rem_input_tokens}",
-        #    flush=True,
-        #)
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         total_tokens = req.extend_input_len + min(
-            compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens), CLIP_MAX_NEW_TOKENS
+            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
@@ -661,7 +602,7 @@ class PrefillAdder:
                     prefix_len,
                     input_tokens,
                     min(
-                        compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens),
+                        req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
@@ -716,7 +657,7 @@ class PrefillAdder:
         preemptible_reqs = []
         min_tokens_to_remove = (
             req.extend_input_len
-            + min(compute_dcp_local_max_new_tokens(req.sampling_params.max_new_tokens), CLIP_MAX_NEW_TOKENS)
+            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens
         )
         for running_req in sorted_running_reqs:
@@ -754,4 +695,3 @@ class PrefillAdder:
         self.running_batch.filter_batch(keep_indices=keep_indices)
         self.preempt_list.extend(preemptible_reqs)
         return True
-
