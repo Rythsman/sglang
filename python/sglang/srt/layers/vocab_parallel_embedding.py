@@ -33,6 +33,11 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size
+)
+
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -479,6 +484,15 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+            # logger.info(
+            #     "VocabParallelEmbedding: tp_rank=%d/%d, input=%s, masked=%s, out=%s, mask=%s",
+            #     get_tensor_model_parallel_rank(),
+            #     get_tensor_model_parallel_world_size(),
+            #     tuple(input_.shape),
+            #     tuple(masked_input.shape),
+            #     tuple(output_parallel.shape),
+            #     tuple(input_mask.shape),
+            # )
             # Reduce across all the model parallel GPUs.
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
@@ -569,3 +583,4 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, input_):
         del input_
         raise RuntimeError("LMHead's weights should be used in the sampler.")
+

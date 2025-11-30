@@ -725,30 +725,54 @@ class FlashInferMLAIndicesUpdaterDecode:
             )
 
             # TODO(augusto.yjh) 更新kv_indices
+            # def filter_seq_indices(
+            #     paged_kernel_lens,
+            #     paged_kernel_lens_cumsum,
+            #     dcp_rank: int,
+            #     dpc_world_size: int,
+            # ):
+            #     paged_kernel_lens_split = (
+            #         (paged_kernel_lens - dcp_rank - 1) // dpc_world_size
+            #     ) + 1
+            #     all_filered_indice = []
+            #     for i in range(len(paged_kernel_lens_split)):
+            #         indice = (
+            #             torch.arange(
+            #                 paged_kernel_lens_split[i], device=paged_kernel_lens.device
+            #             )
+            #             * dpc_world_size
+            #             + dcp_rank
+            #             + paged_kernel_lens_cumsum[i]
+            #         )
+            #         all_filered_indice.append(indice)
+            #     filterd_kv_indices = torch.cat(all_filered_indice, dim=0).to(
+            #         device="cuda"
+            #     )
+            #     return paged_kernel_lens_split, filterd_kv_indices
             def filter_seq_indices(
-                paged_kernel_lens,
-                paged_kernel_lens_cumsum,
+                paged_kernel_lens: torch.Tensor,
+                paged_kernel_lens_cumsum: torch.Tensor,
                 dcp_rank: int,
-                dpc_world_size: int,
+                dcp_world_size: int,
             ):
-                paged_kernel_lens_split = (
-                    (paged_kernel_lens - dcp_rank - 1) // dpc_world_size
-                ) + 1
-                all_filered_indice = []
-                for i in range(len(paged_kernel_lens_split)):
-                    indice = (
-                        torch.arange(
-                            paged_kernel_lens_split[i], device=paged_kernel_lens.device
-                        )
-                        * dpc_world_size
-                        + dcp_rank
-                        + paged_kernel_lens_cumsum[i]
+                device = paged_kernel_lens.device
+                lens = paged_kernel_lens.to(torch.int64)
+                starts = paged_kernel_lens_cumsum[:-1].to(torch.int64)
+                paged_kernel_lens_split = ((lens - dcp_rank - 1) // dcp_world_size) + 1
+                paged_kernel_lens_split.clamp_(min=0)
+                total_local = int(paged_kernel_lens_split.sum().item())
+                if total_local == 0:
+                    return paged_kernel_lens_split, torch.empty(
+                                0, dtype=torch.int64, device="cuda"
                     )
-                    all_filered_indice.append(indice)
-                filterd_kv_indices = torch.cat(all_filered_indice, dim=0).to(
-                    device="cuda"
-                )
-                return paged_kernel_lens_split, filterd_kv_indices
+                max_split = int(paged_kernel_lens_split.max().item())
+                j = torch.arange(max_split, device=device, dtype=torch.int64)
+                starts_ = starts.view(-1, 1)
+                j_ = j.view(1, -1)
+                ids = starts_ + dcp_rank + j_ * dcp_world_size
+                mask = j_ < paged_kernel_lens_split.view(-1, 1)
+                filter_kv_indices = ids[mask].to(device="cuda")
+                return paged_kernel_lens_split, filter_kv_indices
 
             if get_dcp_world_size() > 1:
                 filtered_paged_kernel_lens, filterd_kv_indices = filter_seq_indices(

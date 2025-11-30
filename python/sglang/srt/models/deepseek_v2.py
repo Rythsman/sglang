@@ -42,6 +42,7 @@ from sglang.srt.distributed import (
     get_dcp_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
     tensor_model_parallel_all_gather,
@@ -1606,10 +1607,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         if get_dcp_world_size() > 1:
             q_pe = q_pe.contiguous()
             q_nope_out = q_nope_out.contiguous()
-            gathered_q_pe = get_dcp_group().all_gather(q_pe, dim=-2)
-            gathered_q_nope_out = get_dcp_group().all_gather(q_nope_out, dim=-2)
-            q_pe = gathered_q_pe
-            q_nope_out = gathered_q_nope_out
+            # gathered_q_pe = get_dcp_group().all_gather(q_pe, dim=-2)
+            # gathered_q_nope_out = get_dcp_group().all_gather(q_nope_out, dim=-2)
+            # q_pe = gathered_q_pe
+            # q_nope_out = gathered_q_nope_out
+            combined = torch.cat([q_pe, q_nope_out], dim=-1)
+            gathered = get_dcp_group().all_gather(combined, dim=-2)
+            d_pe = q_pe.size(-1)
+            d_nope = q_nope_out.size(-1)
+            q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
         return (
             q_pe,
             k_pe,
@@ -2885,6 +2891,34 @@ class DeepseekV2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # ==== dbg ====
+        # if not hasattr(self, "_debug_step_id"):
+        #     self._debug_step_id = 0
+        # self._debug_step_id += 1
+        # step_id = self._debug_step_id
+        # tp_rank = get_tensor_model_parallel_rank()
+        # try:
+        #     mode_str = str(forward_batch.forward_mode)
+        # except Exception:
+        #     mode_str = "unknown"
+
+        # seq_lens_cpu = (
+        #     list(forward_batch.seq_lens_cpu) if forward_batch.seq_lens_cpu is not None else None
+        # )
+        # extend_lens_cpu = (
+        #     list(forward_batch.extend_prefix_lens_cpu)
+        #     if getattr(forward_batch, "extend_prefix_lens_cpu", None) is not None
+        #     else None
+        # )
+        # logger.info(
+        #     f"[TP{tp_rank}] Step={step_id} ForwardBatch: "
+        #     f"mode={mode_str}, "
+        #     f"input_ids_shape={tuple(input_ids.shape) if input_ids is not None else None}, "
+        #     f"positions_shape={tuple(positions.shape)}, "
+        #     f"seq_lens_cpu={seq_lens_cpu}, "
+        #     f"extend_prefix_lens_cpu={extend_lens_cpu}"
+        # )
+        # ==== dbg ====
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
         )
