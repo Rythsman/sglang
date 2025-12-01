@@ -28,6 +28,9 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.layers.attention.utils import (
+    filter_seq_indices_triton,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -760,18 +763,36 @@ class FlashInferMLAIndicesUpdaterDecode:
                 starts = paged_kernel_lens_cumsum[:-1].to(torch.int64)
                 paged_kernel_lens_split = ((lens - dcp_rank - 1) // dcp_world_size) + 1
                 paged_kernel_lens_split.clamp_(min=0)
-                total_local = int(paged_kernel_lens_split.sum().item())
-                if total_local == 0:
+                
+                # Use Triton kernel to avoid .item() calls for max_split and total_local
+                bs = len(paged_kernel_lens)
+                if bs == 0:
                     return paged_kernel_lens_split, torch.empty(
-                                0, dtype=torch.int64, device="cuda"
+                        0, dtype=torch.int64, device="cuda"
                     )
-                max_split = int(paged_kernel_lens_split.max().item())
-                j = torch.arange(max_split, device=device, dtype=torch.int64)
-                starts_ = starts.view(-1, 1)
-                j_ = j.view(1, -1)
-                ids = starts_ + dcp_rank + j_ * dcp_world_size
-                mask = j_ < paged_kernel_lens_split.view(-1, 1)
-                filter_kv_indices = ids[mask].to(device="cuda")
+                
+                # Compute cumulative offsets (this is async, no host sync)
+                offsets = torch.zeros(bs + 1, dtype=torch.int64, device=device)
+                offsets[1:] = torch.cumsum(paged_kernel_lens_split, dim=0)
+                # Only one .item() call for final size check (reduced from 2 .item() calls)
+                total_size = int(offsets[-1].item())
+                
+                if total_size == 0:
+                    return paged_kernel_lens_split, torch.empty(
+                        0, dtype=torch.int64, device="cuda"
+                    )
+                
+                filter_kv_indices = torch.empty(
+                    total_size, dtype=torch.int64, device=device
+                )
+                filter_seq_indices_triton[(bs,)](
+                    paged_kernel_lens_split,
+                    starts,
+                    offsets,
+                    dcp_rank,
+                    dcp_world_size,
+                    filter_kv_indices,
+                )
                 return paged_kernel_lens_split, filter_kv_indices
 
             if get_dcp_world_size() > 1:

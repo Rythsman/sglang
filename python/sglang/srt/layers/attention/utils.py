@@ -103,6 +103,51 @@ def create_flashmla_kv_indices_triton(
 
 
 @triton.jit
+def filter_seq_indices_triton(
+    paged_kernel_lens_split_ptr,  # [batch_size]
+    starts_ptr,  # [batch_size]
+    offsets_ptr,  # [batch_size + 1] - cumulative offsets, computed in Python
+    dcp_rank: tl.constexpr,
+    dcp_world_size: tl.constexpr,
+    filter_kv_indices_ptr,  # [max_output_size]
+    BLOCK_SIZE: tl.constexpr = 256,
+):
+    """
+    Filter sequence indices for DCP (Data Context Parallelism).
+    
+    Each program processes one sequence. For sequence i:
+    - Generate indices: starts[i] + dcp_rank + j * dcp_world_size
+    - Where j ranges from 0 to paged_kernel_lens_split[i] - 1
+    - Write filtered indices to output buffer starting at offsets[i]
+    
+    Args:
+        paged_kernel_lens_split_ptr: Pointer to tensor of shape [batch_size]
+        starts_ptr: Pointer to tensor of shape [batch_size] 
+        offsets_ptr: Pointer to cumulative offsets [batch_size + 1], computed in Python
+        dcp_rank: Current DCP rank
+        dcp_world_size: Total DCP world size
+        filter_kv_indices_ptr: Output buffer for filtered indices
+        BLOCK_SIZE: Block size for parallel processing within each sequence
+    """
+    seq_idx = tl.program_id(axis=0)
+    split_len = tl.load(paged_kernel_lens_split_ptr + seq_idx).to(tl.int64)
+    start = tl.load(starts_ptr + seq_idx).to(tl.int64)
+    base_offset = tl.load(offsets_ptr + seq_idx).to(tl.int64)
+    
+    # Process elements in blocks
+    num_blocks = tl.cdiv(split_len, BLOCK_SIZE)
+    for block_idx in range(num_blocks):
+        block_start = block_idx * BLOCK_SIZE
+        block_end = tl.minimum(block_start + BLOCK_SIZE, split_len)
+        
+        # Process elements in this block
+        for j in range(block_start, block_end):
+            idx = start + dcp_rank + j * dcp_world_size
+            output_pos = base_offset + j
+            tl.store(filter_kv_indices_ptr + output_pos, idx)
+
+
+@triton.jit
 def _correct_attn_cp_out_kernel(
     outputs_ptr,
     new_output_ptr,
