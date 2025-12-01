@@ -50,6 +50,55 @@ def create_flashinfer_kv_indices_triton(
 
 
 @triton.jit
+def filter_kv_indices_dcp_triton(
+    kv_indices_in_ptr,       # [total_len] input kv_indices
+    in_indptr_ptr,           # [bs+1] cumsum of paged_kernel_lens
+    kv_indices_out_ptr,      # [out_total_len] output filtered kv_indices
+    out_indptr_ptr,          # [bs+1] cumsum of filtered_paged_kernel_lens
+    dcp_rank: tl.constexpr,
+    dcp_world_size: tl.constexpr,
+):
+    """
+    Triton kernel to filter and gather kv_indices for DCP (Data Center Parallel).
+
+    For each batch item, this kernel:
+    1. Reads the input kv_indices at positions: in_start + dcp_rank + j * dcp_world_size
+       for j in [0, filtered_len)
+    2. Divides the gathered values by dcp_world_size
+    3. Writes to the output buffer at contiguous positions
+
+    This avoids the .item() sync that would be needed to compute max_split in Python.
+    """
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)  # batch index
+
+    # Get input/output positions for this batch item
+    in_start = tl.load(in_indptr_ptr + pid).to(tl.int64)
+    in_end = tl.load(in_indptr_ptr + pid + 1).to(tl.int64)
+    in_len = in_end - in_start
+
+    out_start = tl.load(out_indptr_ptr + pid).to(tl.int64)
+    out_end = tl.load(out_indptr_ptr + pid + 1).to(tl.int64)
+    out_len = out_end - out_start
+
+    # Process in blocks
+    num_loop = tl.cdiv(out_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        j = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
+        mask = j < out_len
+
+        # Compute input index: in_start + dcp_rank + j * dcp_world_size
+        in_idx = in_start + dcp_rank + j * dcp_world_size
+
+        # Gather from input kv_indices
+        data = tl.load(kv_indices_in_ptr + in_idx, mask=mask)
+
+        # Divide by dcp_world_size and store
+        data = data // dcp_world_size
+        tl.store(kv_indices_out_ptr + out_start + j, data, mask=mask)
+
+
+@triton.jit
 def create_flashmla_kv_indices_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
     req_pool_indices_ptr,
