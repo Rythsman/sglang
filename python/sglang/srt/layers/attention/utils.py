@@ -293,3 +293,125 @@ def cp_lse_ag_out_rs(
     assert out.is_contiguous()
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
     return out
+
+
+@triton.jit
+def filter_seq_indices_triton_kernel(
+    paged_kernel_lens_ptr,  # [batch_size]
+    starts_ptr,  # [batch_size]
+    paged_kernel_lens_split_ptr,  # [batch_size] output
+    filter_kv_indices_ptr,  # [total_output] output
+    output_offsets_ptr,  # [batch_size] cumsum offsets for output
+    dcp_rank: tl.constexpr,
+    dcp_world_size: tl.constexpr,
+    max_split: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Triton kernel to filter sequence indices for distributed context parallel.
+    Each program handles one sequence in the batch.
+    """
+    pid = tl.program_id(axis=0)
+    
+    # Load input data for this sequence
+    lens = tl.load(paged_kernel_lens_ptr + pid)
+    starts = tl.load(starts_ptr + pid)
+    
+    # Calculate split length for this rank
+    split_len = ((lens - dcp_rank - 1) // dcp_world_size) + 1
+    split_len = tl.maximum(split_len, 0)
+    
+    # Store split length
+    tl.store(paged_kernel_lens_split_ptr + pid, split_len)
+    
+    # Get output offset for this sequence
+    output_offset = tl.load(output_offsets_ptr + pid)
+    
+    # Generate and store filtered indices
+    num_loops = tl.cdiv(max_split, BLOCK_SIZE)
+    for i in range(num_loops):
+        j_offset = i * BLOCK_SIZE
+        j = j_offset + tl.arange(0, BLOCK_SIZE)
+        
+        # Compute indices: starts + dcp_rank + j * dcp_world_size
+        ids = starts + dcp_rank + j * dcp_world_size
+        
+        # Mask valid indices
+        mask = j < split_len
+        
+        # Count valid indices in this block
+        if tl.sum(mask.to(tl.int32)) > 0:
+            # Compact write using mask
+            write_offset = output_offset + j_offset
+            tl.store(filter_kv_indices_ptr + write_offset + tl.arange(0, BLOCK_SIZE), 
+                    ids, mask=mask)
+
+
+def filter_seq_indices_triton(
+    paged_kernel_lens: torch.Tensor,
+    paged_kernel_lens_cumsum: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Triton implementation of filter_seq_indices that avoids GPU-CPU sync.
+    
+    Note: This implementation still requires cumsum which has a small sync overhead,
+    but avoids the explicit .item() calls. For best performance without any sync,
+    use the optimized PyTorch version in flashinfer_mla_backend.py.
+    
+    Args:
+        paged_kernel_lens: Tensor of shape [batch_size] with sequence lengths
+        paged_kernel_lens_cumsum: Cumulative sum including 0 at the start
+        dcp_rank: Current rank in distributed context parallel
+        dcp_world_size: Total number of ranks in DCP
+    
+    Returns:
+        Tuple of (paged_kernel_lens_split, filter_kv_indices)
+    """
+    device = paged_kernel_lens.device
+    batch_size = paged_kernel_lens.shape[0]
+    
+    # Convert to int64
+    lens = paged_kernel_lens.to(torch.int64)
+    starts = paged_kernel_lens_cumsum[:-1].to(torch.int64)
+    
+    # Calculate split lengths
+    paged_kernel_lens_split = ((lens - dcp_rank - 1) // dcp_world_size) + 1
+    paged_kernel_lens_split.clamp_(min=0)
+    
+    # Use max of original lens as upper bound for allocation
+    # Allocate with upper bound to avoid sync
+    max_possible_output = lens.sum()  # This is the theoretical max
+    filter_kv_indices = torch.empty(
+        max_possible_output, dtype=torch.int64, device=device
+    )
+    
+    # Calculate output offsets (cumsum of split lengths)
+    output_offsets = torch.cat([
+        torch.zeros(1, dtype=torch.int64, device=device),
+        torch.cumsum(paged_kernel_lens_split, dim=0)
+    ])
+    
+    # Use max of original lens as upper bound
+    max_split = lens.max()
+    
+    # Launch kernel
+    BLOCK_SIZE = 256
+    grid = (batch_size,)
+    
+    filter_seq_indices_triton_kernel[grid](
+        lens,
+        starts,
+        paged_kernel_lens_split,
+        filter_kv_indices,
+        output_offsets[:-1],  # exclude last element
+        dcp_rank=dcp_rank,
+        dcp_world_size=dcp_world_size,
+        max_split=max_split,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    
+    # Return only the valid portion (slice operation doesn't sync)
+    actual_output_size = output_offsets[-1]
+    return paged_kernel_lens_split, filter_kv_indices[:actual_output_size]
