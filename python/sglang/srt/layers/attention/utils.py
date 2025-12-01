@@ -293,3 +293,50 @@ def cp_lse_ag_out_rs(
     assert out.is_contiguous()
     out = cp_group.reduce_scatter_along_dim(out, dim=1)
     return out
+
+
+@triton.jit
+def filter_seq_indices_triton_kernel(
+    paged_kernel_lens_split_ptr,
+    starts_ptr,
+    output_indices_ptr,
+    dcp_rank: tl.constexpr,
+    dcp_world_size: tl.constexpr,
+    batch_size: tl.constexpr,
+    max_split: tl.constexpr,
+):
+    """
+    Filter sequence indices for distributed context parallel processing.
+    This kernel avoids host synchronization by computing everything on GPU.
+
+    Args:
+        paged_kernel_lens_split_ptr: Pointer to tensor of shape [batch_size] with split lengths
+        starts_ptr: Pointer to tensor of shape [batch_size] with start indices
+        output_indices_ptr: Pointer to output tensor for filtered indices (pre-allocated)
+        dcp_rank: Current rank in DCP group
+        dcp_world_size: World size of DCP group
+        batch_size: Number of sequences
+        max_split: Maximum split length (used for grid size)
+    """
+    seq_idx = tl.program_id(axis=0)
+    j_idx = tl.program_id(axis=1)
+
+    if seq_idx >= batch_size or j_idx >= max_split:
+        return
+
+    split_len = tl.load(paged_kernel_lens_split_ptr + seq_idx)
+    start = tl.load(starts_ptr + seq_idx)
+
+    # Check if this j_idx is valid for this sequence
+    if j_idx < split_len:
+        # Compute the index: start + dcp_rank + j * dcp_world_size
+        index = start + dcp_rank + j_idx * dcp_world_size
+
+        # Calculate output position: cumulative sum of previous split_lens + current j_idx
+        pos = 0
+        for i in range(seq_idx):
+            prev_len = tl.load(paged_kernel_lens_split_ptr + i)
+            pos += prev_len
+        pos += j_idx
+
+        tl.store(output_indices_ptr + pos, index)

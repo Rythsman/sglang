@@ -760,18 +760,23 @@ class FlashInferMLAIndicesUpdaterDecode:
                 starts = paged_kernel_lens_cumsum[:-1].to(torch.int64)
                 paged_kernel_lens_split = ((lens - dcp_rank - 1) // dcp_world_size) + 1
                 paged_kernel_lens_split.clamp_(min=0)
-                total_local = int(paged_kernel_lens_split.sum().item())
-                if total_local == 0:
-                    return paged_kernel_lens_split, torch.empty(
-                                0, dtype=torch.int64, device="cuda"
-                    )
-                max_split = int(paged_kernel_lens_split.max().item())
-                j = torch.arange(max_split, device=device, dtype=torch.int64)
+                
+                # Calculate upper bound for max_split without host sync
+                # max_split = max(paged_kernel_lens_split) <= max(paged_kernel_lens) // dcp_world_size + 1
+                # Use paged_kernel_lens_sum (already a Python int) to compute conservative upper bound
+                # This avoids any tensor .item() operations that would cause host sync
+                max_split_upper_bound = paged_kernel_lens_sum // dcp_world_size + bs
+                
+                # Create j tensor with upper bound size (no .item() on tensor operations)
+                j = torch.arange(max_split_upper_bound, device=device, dtype=torch.int64)
                 starts_ = starts.view(-1, 1)
                 j_ = j.view(1, -1)
                 ids = starts_ + dcp_rank + j_ * dcp_world_size
                 mask = j_ < paged_kernel_lens_split.view(-1, 1)
                 filter_kv_indices = ids[mask].to(device="cuda")
+                
+                # No need to check empty case explicitly - mask operation handles it
+                # If mask is all False, filter_kv_indices will be empty tensor automatically
                 return paged_kernel_lens_split, filter_kv_indices
 
             if get_dcp_world_size() > 1:
