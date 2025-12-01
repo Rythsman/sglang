@@ -580,7 +580,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
 
-class DCPPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+class DCPPagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
         self,
         size: int,
@@ -589,21 +589,63 @@ class DCPPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
-        dcp_rank: int,
-        dcp_world_size: int,
+        dcp_rank: int = 0,
+        dcp_world_size: int = 1,
     ):
-        super().__init__(
+        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+        self.dcp_rank = dcp_rank
+        self.dcp_world_size = dcp_world_size
+        self.real_allocator = PagedTokenToKVPoolAllocator(
             size,
-            page_size * dcp_world_size,
+            dcp_world_size * page_size,
             dtype,
             device,
             kvcache,
             need_sort,
         )
-        self.dcp_rank = dcp_rank
-        self.dcp_world_size = dcp_world_size
 
-    def _filter_local_indices(self, indices):
+    def available_size(self):
+        return self.real_allocator.available_size()
+
+    def restore_state(self, state):
+        return self.real_allocator.restore_state(state)
+
+    def backup_state(self):
+        return self.real_allocator.backup_state()
+
+    def free_group_begin(self):
+        return self.real_allocator.free_group_begin()
+
+    def free_group_end(self):
+        return self.real_allocator.free_group_end()
+
+    def merge_and_sort_free(self):
+        return self.real_allocator.merge_and_sort_free()
+
+    def get_cpu_copy(self, indices):
+        return self.real_allocator.get_cpu_copy(self.filter_local_indices(indices))
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        return self.real_allocator.load_cpu_copy(
+            kv_cache_cpu, self.filter_local_indices(indices)
+        )
+
+    def alloc_extend(self, *args, **kwargs):
+        return self.real_allocator.alloc_extend(*args, **kwargs)
+
+    def alloc_decode(self, *args, **kwargs):
+        return self.real_allocator.alloc_decode(*args, **kwargs)
+
+    def clear(self):
+        return self.real_allocator.clear()
+
+    def alloc(self, need_size: int):
+        raise NotImplementedError()
+
+    def free(self, free_index: torch.Tensor):
+        return self.real_allocator.free(free_index)
+
+    def filter_local_indices(self, indices):
         # TODO write a triton kernel to make this faster
         indices = (
             indices[indices % self.dcp_world_size == self.dcp_rank]
@@ -611,13 +653,3 @@ class DCPPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         )
         return indices
 
-    def get_cpu_copy(self, indices):
-        return self._kvcache.get_cpu_copy(
-            self._filter_local_indices(indices),
-        )
-
-    def load_cpu_copy(self, kv_cache_cpu, indices):
-        return self._kvcache.load_cpu_copy(
-            kv_cache_cpu,
-            self._filter_local_indices(indices),
-        )

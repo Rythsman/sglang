@@ -1726,7 +1726,7 @@ class ModelRunner:
                         if dcp_world_size > 1:
                             self.token_to_kv_pool_allocator = DCPPagedTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
-                                page_size=self.page_size,
+                                page_size=1,
                                 dtype=self.kv_cache_dtype,
                                 device=self.device,
                                 kvcache=self.token_to_kv_pool,

@@ -730,7 +730,7 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
-        self.page_size = self.page_size * get_dcp_world_size()
+        cache_page_size = self.page_size * get_dcp_world_size()
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
@@ -742,7 +742,7 @@ class Scheduler(
             self.tree_cache = ChunkCacheClass(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
+                page_size=cache_page_size,
             )
         else:
             if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
@@ -755,7 +755,7 @@ class Scheduler(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool=self.token_to_kv_pool_allocator,
                     tp_cache_group=self.tp_cpu_group,
-                    page_size=self.page_size,
+                    page_size=cache_page_size,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
@@ -770,7 +770,7 @@ class Scheduler(
                         if self.server_args.enable_dp_attention
                         else self.tp_cpu_group
                     ),
-                    page_size=self.page_size,
+                    page_size=cache_page_size,
                     eviction_policy=server_args.radix_eviction_policy,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
@@ -795,7 +795,7 @@ class Scheduler(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     sliding_window_size=self.sliding_window_size,
-                    page_size=self.page_size,
+                    page_size=cache_page_size,
                     disable=server_args.disable_radix_cache,
                     is_eagle=self.spec_algorithm.is_eagle(),
                 )
@@ -807,7 +807,7 @@ class Scheduler(
                 self.tree_cache = LMCRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
+                    page_size=cache_page_size,
                     disable=server_args.disable_radix_cache,
                     model_config=self.model_config,
                     tp_size=self.tp_size,
@@ -819,7 +819,7 @@ class Scheduler(
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
+                    page_size=cache_page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,

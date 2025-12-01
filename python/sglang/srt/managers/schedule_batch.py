@@ -1274,7 +1274,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
+        if self.tree_cache.page_size == 1:
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
         else:
             last_loc = [
@@ -1706,7 +1706,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         # Allocate memory
-        if self.token_to_kv_pool_allocator.page_size == 1:
+        if self.tree_cache.page_size == 1:
             self.out_cache_loc = self.alloc_token_slots(bs)
         else:
             last_loc = self.req_to_token_pool.req_to_token[
