@@ -1034,6 +1034,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
+        self.attn_tp_rank = attn_tp_rank
+        self.attn_tp_size = attn_tp_size
+        self._merge_q_across_tp = (
+            get_dcp_world_size() > 1 and int(os.getenv("DCP_MERGE_Q", "0")) == 1
+        )
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1052,14 +1057,16 @@ class DeepseekV2AttentionMLA(nn.Module):
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            q_tp_rank = 0 if self._merge_q_across_tp else self.attn_tp_rank
+            q_tp_size = 1 if self._merge_q_across_tp else self.attn_tp_size
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=q_tp_rank,
+                tp_size=q_tp_size,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -1301,6 +1308,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         return self.forward_core(s)
 
+    def _reshape_q_output(self, q_out: torch.Tensor) -> torch.Tensor:
+        if self._merge_q_across_tp:
+            q_out = q_out.view(-1, self.num_heads, self.qk_head_dim)
+            local_start = self.attn_tp_rank * self.num_local_heads
+            local_end = local_start + self.num_local_heads
+            return q_out[:, local_start:local_end, :].contiguous()
+        return q_out.view(-1, self.num_local_heads, self.qk_head_dim)
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -1407,7 +1422,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q = self.q_b_proj(q)[0]
+            q = self._reshape_q_output(q)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -1527,7 +1543,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_lora = q
 
             k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q = self.q_b_proj(q)[0]
+            q = self._reshape_q_output(q)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -1853,7 +1870,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             q_lora = q.clone()  # required for topk_indices
             k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q = self.q_b_proj(q)[0]
+            q = self._reshape_q_output(q)
 
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -2004,7 +2022,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q = self.q_b_proj(q)[0]
+            q = self._reshape_q_output(q)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
