@@ -1034,6 +1034,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
+        # Flag indicating q_b_proj outputs full heads (not TP sharded)
+        self._q_merged = get_dcp_world_size() > 1 and int(os.getenv("DCP_MERGE_Q", "0")) == 1
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1052,15 +1054,26 @@ class DeepseekV2AttentionMLA(nn.Module):
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
-                q_lora_rank,
-                self.num_heads * self.qk_head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
-            )
+            if self._q_merged:
+                self.q_b_proj = ColumnParallelLinear(
+                    q_lora_rank,
+                    self.num_heads * self.qk_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("q_b_proj", prefix),
+                    tp_rank=0,
+                    tp_size=1,
+                )
+            else:
+                self.q_b_proj = ColumnParallelLinear(
+                    q_lora_rank,
+                    self.num_heads * self.qk_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("q_b_proj", prefix),
+                    tp_rank=attn_tp_rank,
+                    tp_size=attn_tp_size,
+                )
         else:
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1407,7 +1420,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            num_q_heads = self.num_heads if self._q_merged else self.num_local_heads
+            q = self.q_b_proj(q)[0].view(-1, num_q_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -1527,7 +1541,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_lora = q
 
             k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            num_q_heads = self.num_heads if self._q_merged else self.num_local_heads
+            q = self.q_b_proj(q)[0].view(-1, num_q_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -1853,7 +1868,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             q_lora = q.clone()  # required for topk_indices
             k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            num_q_heads = self.num_heads if self._q_merged else self.num_local_heads
+            q = self.q_b_proj(q)[0].view(-1, num_q_heads, self.qk_head_dim)
 
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -2004,7 +2020,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            num_q_heads = self.num_heads if self._q_merged else self.num_local_heads
+            q = self.q_b_proj(q)[0].view(-1, num_q_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
