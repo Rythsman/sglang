@@ -1030,6 +1030,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.kv_lora_rank = kv_lora_rank
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
+        self._q_b_proj_tp_size = None
+        self._merge_q_for_dcp = (
+            get_dcp_world_size() > 1 and int(os.getenv("DCP_MERGE_Q", 0)) == 1
+        )
 
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
@@ -1052,15 +1056,21 @@ class DeepseekV2AttentionMLA(nn.Module):
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            q_tp_rank = attn_tp_rank
+            q_tp_size = attn_tp_size
+            if self._merge_q_for_dcp:
+                q_tp_rank = 0
+                q_tp_size = 1
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                tp_rank=q_tp_rank,
+                tp_size=q_tp_size,
             )
+            self._q_b_proj_tp_size = q_tp_size
         else:
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1251,6 +1261,20 @@ class DeepseekV2AttentionMLA(nn.Module):
             ), "MLA Preprocess only works with Unquant or W8A8Int8"
             self.mla_preprocess = None
 
+    def _reshape_q_after_q_b_proj(self, q: torch.Tensor) -> torch.Tensor:
+        q = q.contiguous()
+        if (
+            getattr(self, "_q_b_proj_tp_size", None) == 1
+            and self.num_heads != self.num_local_heads
+        ):
+            q = q.view(-1, self.num_heads, self.qk_head_dim)
+            heads_per_rank = self.num_local_heads
+            attn_tp_rank = get_attention_tp_rank()
+            start = attn_tp_rank * heads_per_rank
+            end = start + heads_per_rank
+            return q[:, start:end, :].contiguous()
+        return q.view(-1, self.num_local_heads, self.qk_head_dim)
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -1407,7 +1431,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q = self._reshape_q_after_q_b_proj(self.q_b_proj(q)[0])
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -1527,7 +1551,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_lora = q
 
             k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q = self._reshape_q_after_q_b_proj(self.q_b_proj(q)[0])
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -1853,7 +1877,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             q_lora = q.clone()  # required for topk_indices
             k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q = self._reshape_q_after_q_b_proj(self.q_b_proj(q)[0])
 
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -2004,7 +2028,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            q = self._reshape_q_after_q_b_proj(self.q_b_proj(q)[0])
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
