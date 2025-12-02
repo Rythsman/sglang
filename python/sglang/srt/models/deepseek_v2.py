@@ -1052,15 +1052,30 @@ class DeepseekV2AttentionMLA(nn.Module):
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
-                q_lora_rank,
-                self.num_heads * self.qk_head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+            # Check if DCP_MERGE_Q is enabled
+            self.use_dcp_merge_q = (
+                get_dcp_world_size() > 1 and int(os.getenv("DCP_MERGE_Q", 0)) == 1
             )
+            if self.use_dcp_merge_q:
+                self.q_b_proj = ColumnParallelLinear(
+                    q_lora_rank,
+                    self.num_heads * self.qk_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("q_b_proj", prefix),
+                    tp_rank=0,
+                    tp_size=1,
+                )
+            else:
+                self.q_b_proj = ColumnParallelLinear(
+                    q_lora_rank,
+                    self.num_heads * self.qk_head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=add_prefix("q_b_proj", prefix),
+                    tp_rank=attn_tp_rank,
+                    tp_size=attn_tp_size,
+                )
         else:
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1527,7 +1542,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_lora = q
 
             k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            # When DCP_MERGE_Q is enabled, q_b_proj outputs full num_heads instead of num_local_heads
+            q_heads = self.num_heads if self.use_dcp_merge_q else self.num_local_heads
+            q = self.q_b_proj(q)[0].view(-1, q_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -1538,12 +1555,14 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        # When DCP_MERGE_Q is enabled, q has num_heads dimension instead of num_local_heads
+        q_nope_heads = q_nope.shape[1]  # Get actual number of heads from q_nope shape
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             )
             q_nope_out = q_nope.new_empty(
-                (self.num_local_heads, aligned_m, self.kv_lora_rank)
+                (q_nope_heads, aligned_m, self.kv_lora_rank)
             )
             deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
                 (q_nope_val, q_nope_scale),
@@ -1592,6 +1611,15 @@ class DeepseekV2AttentionMLA(nn.Module):
         if not self._fuse_rope_for_trtllm_mla(forward_batch) and (
             not _use_aiter or not _is_gfx95_supported or self.use_nsa
         ):
+            # When DCP_MERGE_Q is enabled, q_pe has num_heads dimension while k_pe has only 1 head
+            # Need to expand k_pe to match q_pe's first dimension for rotary_emb
+            if self.use_dcp_merge_q and self.q_lora_rank is not None:
+                # q_pe shape: [batch_size * seq_len, num_heads, qk_rope_head_dim]
+                # k_pe shape: [batch_size * seq_len, 1, qk_rope_head_dim]
+                # Expand k_pe to match q_pe's num_heads dimension
+                batch_seq_len = q_pe.shape[0]
+                num_heads_q = q_pe.shape[1]
+                k_pe = k_pe.expand(batch_seq_len, num_heads_q, -1)
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         topk_indices = None
@@ -1604,7 +1632,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 layer_id=self.layer_id,
             )
         # TODO(augusto.yjh) 这里要all_gather q_pe 和 q_node_out,以 tp8为例， [1, 8, 64] [1, 8, 512] 经过all gather后为 [1, 64, 64] [1, 64, 512], k_pe 为 [1, 1, 64], k_nope 为 [1, 1, 512], 从 local heads到all heads
-        if get_dcp_world_size() > 1:
+        # When DCP_MERGE_Q is enabled, q_pe and q_nope_out already have all heads, so skip all_gather
+        if get_dcp_world_size() > 1 and not self.use_dcp_merge_q:
             q_pe = q_pe.contiguous()
             q_nope_out = q_nope_out.contiguous()
             # gathered_q_pe = get_dcp_group().all_gather(q_pe, dim=-2)
@@ -1853,12 +1882,16 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             q_lora = q.clone()  # required for topk_indices
             k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            # When DCP_MERGE_Q is enabled, q_b_proj outputs full num_heads instead of num_local_heads
+            q_heads = self.num_heads if self.use_dcp_merge_q else self.num_local_heads
+            q = self.q_b_proj(q)[0].view(-1, q_heads, self.qk_head_dim)
 
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
             k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+            # When DCP_MERGE_Q is enabled, q has num_heads dimension instead of num_local_heads
+            q_nope_heads = q_nope.shape[1]  # Get actual number of heads from q_nope shape
 
             if self.use_deep_gemm_bmm:
                 q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
@@ -1867,7 +1900,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     )
                 )
                 q_nope_out = q_nope.new_empty(
-                    (self.num_local_heads, aligned_m, self.kv_lora_rank)
+                    (q_nope_heads, aligned_m, self.kv_lora_rank)
                 )
                 deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
                     (q_nope_val, q_nope_scale),
@@ -1916,6 +1949,15 @@ class DeepseekV2AttentionMLA(nn.Module):
             if not self._fuse_rope_for_trtllm_mla(forward_batch) and (
                 not _use_aiter or not _is_gfx95_supported
             ):
+                # When DCP_MERGE_Q is enabled, q_pe has num_heads dimension while k_pe has only 1 head
+                # Need to expand k_pe to match q_pe's first dimension for rotary_emb
+                if self.use_dcp_merge_q and self.q_lora_rank is not None:
+                    # q_pe shape: [batch_size * seq_len, num_heads, qk_rope_head_dim]
+                    # k_pe shape: [batch_size * seq_len, 1, qk_rope_head_dim]
+                    # Expand k_pe to match q_pe's num_heads dimension
+                    batch_seq_len = q_pe.shape[0]
+                    num_heads_q = q_pe.shape[1]
+                    k_pe = k_pe.expand(batch_seq_len, num_heads_q, -1)
                 q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         # TODO: multi-stream indexer
