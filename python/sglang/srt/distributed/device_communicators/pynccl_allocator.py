@@ -1,8 +1,8 @@
+import json
 import os
 import tempfile
-from contextlib import nullcontext
-import json
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.utils.cpp_extension
@@ -113,7 +113,7 @@ def get_nccl_mem_pool():
     return _mem_pool
 
 
-#region agent log
+# region agent log
 def _agent_log(hypothesis_id: str, location: str, message: str, data: dict):
     try:
         payload = {
@@ -125,11 +125,17 @@ def _agent_log(hypothesis_id: str, location: str, message: str, data: dict):
             "data": data,
             "timestamp": int(time.time() * 1000),
         }
-        with open(r"d:\Code\sglang-ant\.cursor\debug.log", "a", encoding="utf-8") as f:
+        with open(
+            r"/home/wanghao44/code/sglang-dcp-2/deploy_tools/dco_dbg.log",
+            "a",
+            encoding="utf-8",
+        ) as f:
             f.write(json.dumps(payload, ensure_ascii=True) + "\n")
     except Exception:
         pass
-#endregion
+
+
+# endregion
 
 
 class SymmetricMemoryContext:
@@ -182,7 +188,7 @@ class SymmetricMemoryContext:
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = self
 
-        #region agent log
+        # region agent log
         _agent_log(
             hypothesis_id="H1",
             location="pynccl_allocator.py:SymmetricMemoryContext.__enter__",
@@ -200,7 +206,7 @@ class SymmetricMemoryContext:
                 "env_set_value": os.environ.get("SGLANG_TMP_NCCL_COMM_VALUE"),
             },
         )
-        #endregion
+        # endregion
 
         return self
 
@@ -220,7 +226,7 @@ class SymmetricMemoryContext:
 
         self.exited = True
 
-        #region agent log
+        # region agent log
         _agent_log(
             hypothesis_id="H1",
             location="pynccl_allocator.py:SymmetricMemoryContext.__exit__",
@@ -233,7 +239,7 @@ class SymmetricMemoryContext:
                 "exc_type": str(exc_type) if exc_type else None,
             },
         )
-        #endregion
+        # endregion
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):

@@ -23,9 +23,11 @@ If you only need to use the distributed environment without model/pipeline
 """
 import contextlib
 import gc
+import json
 import logging
 import os
 import pickle
+import time
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -34,8 +36,6 @@ from datetime import timedelta
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
-import json
-import time
 
 import torch
 import torch.distributed
@@ -503,7 +503,7 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        #region agent log
+        # region agent log
         _agent_log(
             hypothesis_id="H2",
             location="parallel_state.py:GroupCoordinator.graph_capture",
@@ -515,12 +515,14 @@ class GroupCoordinator:
                 "stream_id": id(stream),
                 "curr_stream_id": id(curr_stream),
                 "pynccl_present": self.pynccl_comm is not None,
-                "pynccl_disabled": getattr(self.pynccl_comm, "disabled", None)
-                if self.pynccl_comm is not None
-                else None,
+                "pynccl_disabled": (
+                    getattr(self.pynccl_comm, "disabled", None)
+                    if self.pynccl_comm is not None
+                    else None
+                ),
             },
         )
-        #endregion
+        # endregion
 
         with self.device_module.stream(stream), maybe_ca_context:
             # In graph mode, we have to be very careful about the collective
@@ -565,7 +567,7 @@ class GroupCoordinator:
                 try:
                     yield graph_capture_context
                 finally:
-                    #region agent log
+                    # region agent log
                     _agent_log(
                         hypothesis_id="H2",
                         location="parallel_state.py:GroupCoordinator.graph_capture",
@@ -576,14 +578,14 @@ class GroupCoordinator:
                             "world": self.world_size,
                             "stream_id": id(stream),
                             "pynccl_present": self.pynccl_comm is not None,
-                            "pynccl_disabled": getattr(
-                                self.pynccl_comm, "disabled", None
-                            )
-                            if self.pynccl_comm is not None
-                            else None,
+                            "pynccl_disabled": (
+                                getattr(self.pynccl_comm, "disabled", None)
+                                if self.pynccl_comm is not None
+                                else None
+                            ),
                         },
                     )
-                    #endregion
+                    # endregion
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
@@ -1591,7 +1593,8 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
 
 logger = logging.getLogger(__name__)
 
-#region agent log
+
+# region agent log
 def _agent_log(hypothesis_id: str, location: str, message: str, data: dict):
     try:
         payload = {
@@ -1603,11 +1606,17 @@ def _agent_log(hypothesis_id: str, location: str, message: str, data: dict):
             "data": data,
             "timestamp": int(time.time() * 1000),
         }
-        with open(r"d:\Code\sglang-ant\.cursor\debug.log", "a", encoding="utf-8") as f:
+        with open(
+            r"/home/wanghao44/code/sglang-dcp-2/deploy_tools/dco_dbg.log",
+            "a",
+            encoding="utf-8",
+        ) as f:
             f.write(json.dumps(payload, ensure_ascii=True) + "\n")
     except Exception:
         pass
-#endregion
+
+
+# endregion
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
