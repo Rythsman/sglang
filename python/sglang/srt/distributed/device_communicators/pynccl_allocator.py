@@ -1,6 +1,8 @@
 import os
 import tempfile
 from contextlib import nullcontext
+import json
+import time
 
 import torch
 import torch.utils.cpp_extension
@@ -111,6 +113,25 @@ def get_nccl_mem_pool():
     return _mem_pool
 
 
+#region agent log
+def _agent_log(hypothesis_id: str, location: str, message: str, data: dict):
+    try:
+        payload = {
+            "sessionId": "debug-session",
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(r"d:\Code\sglang-ant\.cursor\debug.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+#endregion
+
+
 class SymmetricMemoryContext:
     """
     Context manager for using symmetric memory with pynccl.
@@ -161,6 +182,26 @@ class SymmetricMemoryContext:
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = self
 
+        #region agent log
+        _agent_log(
+            hypothesis_id="H1",
+            location="pynccl_allocator.py:SymmetricMemoryContext.__enter__",
+            message="enter symmetric memory context",
+            data={
+                "group": getattr(self.group_coordinator, "unique_name", "unknown"),
+                "rank": getattr(self.group_coordinator, "rank_in_group", -1),
+                "world": getattr(self.group_coordinator, "world_size", -1),
+                "is_graph_capture": self.is_graph_capture,
+                "graph_pool_id": _graph_pool_id,
+                "pynccl_present": self.group_coordinator.pynccl_comm is not None,
+                "pynccl_disabled": getattr(
+                    self.group_coordinator.pynccl_comm, "disabled", None
+                ),
+                "env_set_value": os.environ.get("SGLANG_TMP_NCCL_COMM_VALUE"),
+            },
+        )
+        #endregion
+
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -178,6 +219,21 @@ class SymmetricMemoryContext:
         _active_symmetric_memory_context = None
 
         self.exited = True
+
+        #region agent log
+        _agent_log(
+            hypothesis_id="H1",
+            location="pynccl_allocator.py:SymmetricMemoryContext.__exit__",
+            message="exit symmetric memory context",
+            data={
+                "group": getattr(self.group_coordinator, "unique_name", "unknown"),
+                "rank": getattr(self.group_coordinator, "rank_in_group", -1),
+                "is_graph_capture": self.is_graph_capture,
+                "graph_pool_id": _graph_pool_id,
+                "exc_type": str(exc_type) if exc_type else None,
+            },
+        )
+        #endregion
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
