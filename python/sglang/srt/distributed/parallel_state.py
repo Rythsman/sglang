@@ -336,6 +336,7 @@ class GroupCoordinator:
             PyNcclCommunicator,
         )
         from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            SymmetricMemoryContext,
             is_symmetric_memory_enabled,
             use_symmetric_memory,
         )
@@ -345,6 +346,7 @@ class GroupCoordinator:
 
         self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
         self.use_symmetric_memory = use_symmetric_memory
+        self.symmetric_memory_context = SymmetricMemoryContext
         if is_hip():
             from sglang.srt.distributed.device_communicators.quick_all_reduce import (
                 QuickAllReduce,
@@ -678,14 +680,12 @@ class GroupCoordinator:
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        output_tensor = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
+        with self.use_symmetric_memory(self):
+            output_tensor = torch.empty(
+                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            )
 
-        # Perform reduce-scatter operation
-        torch.distributed.reduce_scatter_tensor(
-            output_tensor, input_tensor, group=self.device_group
-        )
+        self.reduce_scatter_tensor(output_tensor, input_tensor)
 
         # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
@@ -803,6 +803,37 @@ class GroupCoordinator:
             torch.ops.sglang.reg_all_gather_into_tensor(
                 output, input, group_name=self.unique_name
             )
+
+    # def all_gather_for_dcp(
+    #     self,
+    #     input: torch.Tensor,
+    #     dim: int = -1,
+    # ):
+    #     world_size = self.world_size
+    #     assert (
+    #         -input.dim() <= dim < input.dim()
+    #     ), f"Invalid dim ({dim}) for input tensor with shape {input.size()}"
+    #     if dim < 0:
+    #         dim += input.dim()
+    #     input_size = input.size()
+    #     output_size = (input_size[0] * world_size,) + input_size[1:]
+    #     with self.symmetric_memory_context(self):
+    #         graph_input = input.clone()
+    #         graph_output = torch.empty(
+    #             size=output_size,
+    #             dtype=input.dtype,
+    #             device=input.device,
+    #         )
+    #     self.all_gather_into_tensor(graph_output, graph_input)
+
+    #     # Reshape
+    #     output_tensor = graph_output
+    #     output_tensor = output_tensor.reshape((world_size,) + input_size)
+    #     output_tensor = output_tensor.movedim(0, dim)
+    #     output_tensor = output_tensor.reshape(
+    #         input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+    #     )
+    #     return output_tensor
 
     def all_gather(
         self,
@@ -1508,9 +1539,11 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture(
-        stream=stream
-    ) as context, get_pp_group().graph_capture(context):
+    with (
+        get_tp_group().graph_capture(stream=stream) as context,
+        get_pp_group().graph_capture(context),
+        get_dcp_group().graph_capture(context),
+    ):
         yield context
 
 
