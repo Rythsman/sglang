@@ -297,8 +297,10 @@ class CustomAllreduce:
             data={
                 "rank": self.rank,
                 "world": self.world_size,
-                "backend": self.backend,
                 "is_hip": _is_hip,
+                "full_nvlink": getattr(self, "full_nvlink", None),
+                "max_size": getattr(self, "max_size", None),
+                "disabled": getattr(self, "disabled", None),
             },
         )
         # endregion
@@ -334,8 +336,10 @@ class CustomAllreduce:
             data={
                 "rank": self.rank,
                 "world": self.world_size,
-                "backend": self.backend,
                 "is_hip": _is_hip,
+                "full_nvlink": getattr(self, "full_nvlink", None),
+                "max_size": getattr(self, "max_size", None),
+                "disabled": getattr(self, "disabled", None),
             },
         )
         # endregion
