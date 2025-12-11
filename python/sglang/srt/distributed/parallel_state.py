@@ -579,6 +579,25 @@ class GroupCoordinator:
             else:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
             with maybe_pynccl_context, maybe_pymscclpp_context:
+                # region agent log
+                _agent_log(
+                    hypothesis_id="H3",
+                    location="parallel_state.py:GroupCoordinator.graph_capture",
+                    message="graph capture after change_state",
+                    data={
+                        "group": getattr(self, "unique_name", "unknown"),
+                        "rank": self.rank_in_group,
+                        "world": self.world_size,
+                        "stream_id": id(stream),
+                        "pynccl_present": self.pynccl_comm is not None,
+                        "pynccl_disabled": (
+                            getattr(self.pynccl_comm, "disabled", None)
+                            if self.pynccl_comm is not None
+                            else None
+                        ),
+                    },
+                )
+                # endregion
                 try:
                     yield graph_capture_context
                 finally:

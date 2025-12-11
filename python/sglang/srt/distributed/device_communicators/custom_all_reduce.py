@@ -287,6 +287,21 @@ class CustomAllreduce:
         ops.register_buffer(self._ptr, inp, handles, offsets)
 
     def register_graph_buffers(self):
+        # region agent log
+        from sglang.srt.distributed.parallel_state import _agent_log  # lazy import
+
+        _agent_log(
+            hypothesis_id="H4",
+            location="custom_all_reduce.py:CustomAllReduce.register_graph_buffers",
+            message="register_graph_buffers begin",
+            data={
+                "rank": self.rank,
+                "world": self.world_size,
+                "backend": self.backend,
+                "is_hip": _is_hip,
+            },
+        )
+        # endregion
         if _is_hip:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
             handles, offsets = self._gather_ipc_meta((bytes(handle), offset))
@@ -311,6 +326,19 @@ class CustomAllreduce:
             handles = [d[0] for d in all_data]  # type: ignore
             offsets = [d[1] for d in all_data]  # type: ignore
             ops.register_graph_buffers(self._ptr, handles, offsets)
+        # region agent log
+        _agent_log(
+            hypothesis_id="H4",
+            location="custom_all_reduce.py:CustomAllReduce.register_graph_buffers",
+            message="register_graph_buffers end",
+            data={
+                "rank": self.rank,
+                "world": self.world_size,
+                "backend": self.backend,
+                "is_hip": _is_hip,
+            },
+        )
+        # endregion
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
