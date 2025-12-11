@@ -362,6 +362,21 @@ class GroupCoordinator:
                 device=self.device,
                 use_current_stream=pynccl_use_current_stream,
             )
+            # region agent log
+            _agent_log(
+                hypothesis_id="H3",
+                location="parallel_state.py:GroupCoordinator.__init__",
+                message="pynccl init",
+                data={
+                    "group": self.unique_name,
+                    "world": self.world_size,
+                    "rank": self.rank_in_group,
+                    "use_pynccl": use_pynccl,
+                    "use_current_stream": pynccl_use_current_stream,
+                    "pynccl_disabled": getattr(self.pynccl_comm, "disabled", None),
+                },
+            )
+            # endregion
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
         if use_pymscclpp and self.world_size > 1:
