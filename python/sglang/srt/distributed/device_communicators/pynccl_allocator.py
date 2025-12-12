@@ -75,7 +75,6 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
 _allocator = None
 _mem_pool = None
 _graph_pool_id = None
-_cur_device = None
 _active_symmetric_memory_context = None
 
 
@@ -102,7 +101,7 @@ def restore_symmetric_memory_context(saved_context):
 
 
 def get_nccl_mem_pool():
-    global _allocator, _mem_pool, _cur_device
+    global _allocator, _mem_pool
     if _mem_pool is None:
         out_dir = tempfile.gettempdir()
         nccl_allocator_libname = "nccl_allocator"
@@ -121,7 +120,6 @@ def get_nccl_mem_pool():
             "nccl_free_plug",
         ).allocator()
         _mem_pool = torch.cuda.MemPool(_allocator)
-        _cur_device = torch.cuda.current_device()
     return _mem_pool
 
 
@@ -184,12 +182,13 @@ class SymmetricMemoryContext:
             assert (
                 _graph_pool_id is not None
             ), "graph_pool_id is not set under graph capture"
+            cur_device = torch.cuda.current_device()
             # Pause graph memory pool to use symmetric memory with cuda graph
             if after_2_8_0:
-                torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
+                torch._C._cuda_endAllocateToPool(cur_device, _graph_pool_id)
             else:
                 torch._C._cuda_endAllocateCurrentStreamToPool(
-                    _cur_device, _graph_pool_id
+                    cur_device, _graph_pool_id
                 )
 
         if self.exited:
@@ -234,12 +233,13 @@ class SymmetricMemoryContext:
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         if self.is_graph_capture:
+            cur_device = torch.cuda.current_device()
             if after_2_8_0:
                 torch._C._cuda_beginAllocateCurrentThreadToPool(
-                    _cur_device, _graph_pool_id
+                    cur_device, _graph_pool_id
                 )
             else:
-                torch._C._cuda_beginAllocateToPool(_cur_device, _graph_pool_id)
+                torch._C._cuda_beginAllocateToPool(cur_device, _graph_pool_id)
 
         # Restore env var to support nested/overlapping symmetric memory contexts.
         if self._had_prev_nccl_comm_env:
