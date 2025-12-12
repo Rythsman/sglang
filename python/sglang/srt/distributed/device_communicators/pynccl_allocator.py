@@ -82,6 +82,48 @@ def is_symmetric_memory_enabled():
     return get_global_server_args().enable_symm_mem
 
 
+def _should_enable_symmetric_memory_for_group(
+    group_coordinator: GroupCoordinator, disabled: bool
+) -> bool:
+    """Return whether symmetric memory should be enabled for this group.
+
+    Symmetric memory window registration in NCCL behaves like a collective on the
+    communicator. When multiple communicators (e.g. TP and DCP) both attempt to
+    register windows opportunistically via a general-purpose allocator, ordering
+    differences can lead to NCCL failures.
+
+    In practice, DCP is the most sensitive path (decode all-gather). To improve
+    robustness in multi-group configurations, we default to enabling symmetric
+    memory only for DCP when both TP and DCP are enabled.
+    """
+    if disabled or not is_symmetric_memory_enabled() or group_coordinator.world_size == 1:
+        return False
+
+    # Optional override: comma-separated group prefixes, e.g. "dcp,tp".
+    allowlist = os.environ.get("SGLANG_SYMM_MEM_GROUPS")
+    if allowlist is not None:
+        allow = {s.strip() for s in allowlist.split(",") if s.strip()}
+        # Empty allowlist means "disable everywhere".
+        if not allow:
+            return False
+        group_prefix = group_coordinator.group_name.split(":")[0]
+        return group_prefix in allow
+
+    # Default heuristic: if both TP>1 and DCP>1, enable only for DCP.
+    try:
+        tp_size = int(getattr(get_global_server_args(), "tp_size", 1) or 1)
+    except Exception:
+        tp_size = 1
+    try:
+        dcp_size = int(os.getenv("SGLANG_DCP", "1") or "1")
+    except Exception:
+        dcp_size = 1
+    if tp_size > 1 and dcp_size > 1:
+        return group_coordinator.group_name.split(":")[0] == "dcp"
+
+    return True
+
+
 def set_graph_pool_id(graph_pool_id):
     global _graph_pool_id
     _graph_pool_id = graph_pool_id
@@ -270,9 +312,15 @@ class SymmetricMemoryContext:
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
-    disabled = (
-        not is_symmetric_memory_enabled()
-        or disabled
-        or group_coordinator.world_size == 1
-    )
-    return SymmetricMemoryContext(group_coordinator) if not disabled else nullcontext()
+    # Avoid cross-group nesting. Registration is collective per communicator, and
+    # nested/overlapping usage across different communicators is fragile.
+    active = _active_symmetric_memory_context
+    if (
+        active is not None
+        and getattr(active, "group_coordinator", None) is not None
+        and active.group_coordinator.unique_name != group_coordinator.unique_name
+    ):
+        return nullcontext()
+
+    enabled = _should_enable_symmetric_memory_for_group(group_coordinator, disabled)
+    return SymmetricMemoryContext(group_coordinator) if enabled else nullcontext()
