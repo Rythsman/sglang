@@ -3726,17 +3726,14 @@ def calc_diff(x, y):
     return 1 - sim
 
 
-def get_current_device_stream_fast():
-    """Return the current stream for the current device.
+cached_device_index = -1
 
-    NOTE: Do not cache the device index permanently. The CUDA device may be set
-    after module import (e.g. `torch.cuda.set_device(local_rank)`), and caching
-    the initial device can cause us to fetch a stream from the wrong device.
-    That can break CUDA graph capture detection and may trigger NCCL CUDA errors.
-    """
-    device_module = torch.get_device_module()
-    device_index = device_module.current_device()
-    return device_module.current_stream(device_index)
+
+def get_current_device_stream_fast():
+    global cached_device_index
+    if cached_device_index == -1:
+        cached_device_index = torch.get_device_module().current_device()
+    return torch.get_device_module().current_stream(cached_device_index)
 
 
 def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):

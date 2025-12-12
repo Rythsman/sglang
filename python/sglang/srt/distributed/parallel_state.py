@@ -23,11 +23,9 @@ If you only need to use the distributed environment without model/pipeline
 """
 import contextlib
 import gc
-import json
 import logging
 import os
 import pickle
-import time
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -316,6 +314,24 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
+        # Cache symmetric memory policy for this group.
+        # - When enable_symm_mem is on and DCP is enabled (SGLANG_DCP > 1),
+        #   only the DCP group should use SymmetricMemoryContext.
+        # - When DCP is disabled, keep the original behavior.
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            enable_symm_mem = bool(get_global_server_args().enable_symm_mem)
+        except Exception:
+            enable_symm_mem = False
+        try:
+            dcp_size = int(os.getenv("SGLANG_DCP", "1") or "1")
+        except Exception:
+            dcp_size = 1
+        self.symm_mem_enabled_for_group = bool(
+            enable_symm_mem and (self.group_name == "dcp" if dcp_size > 1 else True)
+        )
+
         # Import communicators
         self.use_pynccl = use_pynccl
         self.pynccl_use_current_stream = pynccl_use_current_stream
@@ -362,21 +378,6 @@ class GroupCoordinator:
                 device=self.device,
                 use_current_stream=pynccl_use_current_stream,
             )
-            # region agent log
-            _agent_log(
-                hypothesis_id="H3",
-                location="parallel_state.py:GroupCoordinator.__init__",
-                message="pynccl init",
-                data={
-                    "group": self.unique_name,
-                    "world": self.world_size,
-                    "rank": self.rank_in_group,
-                    "use_pynccl": use_pynccl,
-                    "use_current_stream": pynccl_use_current_stream,
-                    "pynccl_disabled": getattr(self.pynccl_comm, "disabled", None),
-                },
-            )
-            # endregion
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
         if use_pymscclpp and self.world_size > 1:
@@ -518,27 +519,6 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        # region agent log
-        _agent_log(
-            hypothesis_id="H2",
-            location="parallel_state.py:GroupCoordinator.graph_capture",
-            message="graph capture enter",
-            data={
-                "group": getattr(self, "unique_name", "unknown"),
-                "rank": self.rank_in_group,
-                "world": self.world_size,
-                "stream_id": id(stream),
-                "curr_stream_id": id(curr_stream),
-                "pynccl_present": self.pynccl_comm is not None,
-                "pynccl_disabled": (
-                    getattr(self.pynccl_comm, "disabled", None)
-                    if self.pynccl_comm is not None
-                    else None
-                ),
-            },
-        )
-        # endregion
-
         with self.device_module.stream(stream), maybe_ca_context:
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
@@ -579,47 +559,10 @@ class GroupCoordinator:
             else:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
             with maybe_pynccl_context, maybe_pymscclpp_context:
-                # region agent log
-                _agent_log(
-                    hypothesis_id="H3",
-                    location="parallel_state.py:GroupCoordinator.graph_capture",
-                    message="graph capture after change_state",
-                    data={
-                        "group": getattr(self, "unique_name", "unknown"),
-                        "rank": self.rank_in_group,
-                        "world": self.world_size,
-                        "stream_id": id(stream),
-                        "pynccl_present": self.pynccl_comm is not None,
-                        "pynccl_disabled": (
-                            getattr(self.pynccl_comm, "disabled", None)
-                            if self.pynccl_comm is not None
-                            else None
-                        ),
-                    },
-                )
-                # endregion
                 try:
                     yield graph_capture_context
                 finally:
-                    # region agent log
-                    _agent_log(
-                        hypothesis_id="H2",
-                        location="parallel_state.py:GroupCoordinator.graph_capture",
-                        message="graph capture exit",
-                        data={
-                            "group": getattr(self, "unique_name", "unknown"),
-                            "rank": self.rank_in_group,
-                            "world": self.world_size,
-                            "stream_id": id(stream),
-                            "pynccl_present": self.pynccl_comm is not None,
-                            "pynccl_disabled": (
-                                getattr(self.pynccl_comm, "disabled", None)
-                                if self.pynccl_comm is not None
-                                else None
-                            ),
-                        },
-                    )
-                    # endregion
+                    pass
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
@@ -1626,31 +1569,6 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
 
 
 logger = logging.getLogger(__name__)
-
-
-# region agent log
-def _agent_log(hypothesis_id: str, location: str, message: str, data: dict):
-    try:
-        payload = {
-            "sessionId": "debug-session",
-            "runId": "pre-fix",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(
-            r"/home/wanghao44/code/sglang-dcp-2/deploy_tools/dco_dbg.log",
-            "a",
-            encoding="utf-8",
-        ) as f:
-            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-    except Exception:
-        pass
-
-
-# endregion
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False

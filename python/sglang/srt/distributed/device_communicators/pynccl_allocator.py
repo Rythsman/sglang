@@ -1,7 +1,5 @@
-import json
 import os
 import tempfile
-import time
 from contextlib import nullcontext
 from typing import Optional
 
@@ -75,53 +73,12 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
 _allocator = None
 _mem_pool = None
 _graph_pool_id = None
+_cur_device = None
 _active_symmetric_memory_context = None
 
 
 def is_symmetric_memory_enabled():
     return get_global_server_args().enable_symm_mem
-
-
-def _should_enable_symmetric_memory_for_group(
-    group_coordinator: GroupCoordinator, disabled: bool
-) -> bool:
-    """Return whether symmetric memory should be enabled for this group.
-
-    Symmetric memory window registration in NCCL behaves like a collective on the
-    communicator. When multiple communicators (e.g. TP and DCP) both attempt to
-    register windows opportunistically via a general-purpose allocator, ordering
-    differences can lead to NCCL failures.
-
-    In practice, DCP is the most sensitive path (decode all-gather). To improve
-    robustness in multi-group configurations, we default to enabling symmetric
-    memory only for DCP when both TP and DCP are enabled.
-    """
-    if disabled or not is_symmetric_memory_enabled() or group_coordinator.world_size == 1:
-        return False
-
-    # Optional override: comma-separated group prefixes, e.g. "dcp,tp".
-    allowlist = os.environ.get("SGLANG_SYMM_MEM_GROUPS")
-    if allowlist is not None:
-        allow = {s.strip() for s in allowlist.split(",") if s.strip()}
-        # Empty allowlist means "disable everywhere".
-        if not allow:
-            return False
-        group_prefix = group_coordinator.group_name.split(":")[0]
-        return group_prefix in allow
-
-    # Default heuristic: if both TP>1 and DCP>1, enable only for DCP.
-    try:
-        tp_size = int(getattr(get_global_server_args(), "tp_size", 1) or 1)
-    except Exception:
-        tp_size = 1
-    try:
-        dcp_size = int(os.getenv("SGLANG_DCP", "1") or "1")
-    except Exception:
-        dcp_size = 1
-    if tp_size > 1 and dcp_size > 1:
-        return group_coordinator.group_name.split(":")[0] == "dcp"
-
-    return True
 
 
 def set_graph_pool_id(graph_pool_id):
@@ -143,7 +100,7 @@ def restore_symmetric_memory_context(saved_context):
 
 
 def get_nccl_mem_pool():
-    global _allocator, _mem_pool
+    global _allocator, _mem_pool, _cur_device
     if _mem_pool is None:
         out_dir = tempfile.gettempdir()
         nccl_allocator_libname = "nccl_allocator"
@@ -162,32 +119,8 @@ def get_nccl_mem_pool():
             "nccl_free_plug",
         ).allocator()
         _mem_pool = torch.cuda.MemPool(_allocator)
+        _cur_device = torch.cuda.current_device()
     return _mem_pool
-
-
-# region agent log
-def _agent_log(hypothesis_id: str, location: str, message: str, data: dict):
-    try:
-        payload = {
-            "sessionId": "debug-session",
-            "runId": "pre-fix",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(
-            r"/home/wanghao44/code/sglang-dcp-2/deploy_tools/dco_dbg.log",
-            "a",
-            encoding="utf-8",
-        ) as f:
-            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
-    except Exception:
-        pass
-
-
-# endregion
 
 
 class SymmetricMemoryContext:
@@ -224,13 +157,12 @@ class SymmetricMemoryContext:
             assert (
                 _graph_pool_id is not None
             ), "graph_pool_id is not set under graph capture"
-            cur_device = torch.cuda.current_device()
             # Pause graph memory pool to use symmetric memory with cuda graph
             if after_2_8_0:
-                torch._C._cuda_endAllocateToPool(cur_device, _graph_pool_id)
+                torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
             else:
                 torch._C._cuda_endAllocateCurrentStreamToPool(
-                    cur_device, _graph_pool_id
+                    _cur_device, _graph_pool_id
                 )
 
         if self.exited:
@@ -249,39 +181,18 @@ class SymmetricMemoryContext:
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = self
 
-        # region agent log
-        _agent_log(
-            hypothesis_id="H1",
-            location="pynccl_allocator.py:SymmetricMemoryContext.__enter__",
-            message="enter symmetric memory context",
-            data={
-                "group": getattr(self.group_coordinator, "unique_name", "unknown"),
-                "rank": getattr(self.group_coordinator, "rank_in_group", -1),
-                "world": getattr(self.group_coordinator, "world_size", -1),
-                "is_graph_capture": self.is_graph_capture,
-                "graph_pool_id": _graph_pool_id,
-                "pynccl_present": self.group_coordinator.pynccl_comm is not None,
-                "pynccl_disabled": getattr(
-                    self.group_coordinator.pynccl_comm, "disabled", None
-                ),
-                "env_set_value": os.environ.get("SGLANG_TMP_NCCL_COMM_VALUE"),
-            },
-        )
-        # endregion
-
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
 
         if self.is_graph_capture:
-            cur_device = torch.cuda.current_device()
             if after_2_8_0:
                 torch._C._cuda_beginAllocateCurrentThreadToPool(
-                    cur_device, _graph_pool_id
+                    _cur_device, _graph_pool_id
                 )
             else:
-                torch._C._cuda_beginAllocateToPool(cur_device, _graph_pool_id)
+                torch._C._cuda_beginAllocateToPool(_cur_device, _graph_pool_id)
 
         # Restore env var to support nested/overlapping symmetric memory contexts.
         if self._had_prev_nccl_comm_env:
@@ -295,32 +206,12 @@ class SymmetricMemoryContext:
 
         self.exited = True
 
-        # region agent log
-        _agent_log(
-            hypothesis_id="H1",
-            location="pynccl_allocator.py:SymmetricMemoryContext.__exit__",
-            message="exit symmetric memory context",
-            data={
-                "group": getattr(self.group_coordinator, "unique_name", "unknown"),
-                "rank": getattr(self.group_coordinator, "rank_in_group", -1),
-                "is_graph_capture": self.is_graph_capture,
-                "graph_pool_id": _graph_pool_id,
-                "exc_type": str(exc_type) if exc_type else None,
-            },
-        )
-        # endregion
-
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
-    # Avoid cross-group nesting. Registration is collective per communicator, and
-    # nested/overlapping usage across different communicators is fragile.
-    active = _active_symmetric_memory_context
     if (
-        active is not None
-        and getattr(active, "group_coordinator", None) is not None
-        and active.group_coordinator.unique_name != group_coordinator.unique_name
+        disabled
+        or not getattr(group_coordinator, "symm_mem_enabled_for_group", False)
+        or group_coordinator.world_size == 1
     ):
         return nullcontext()
-
-    enabled = _should_enable_symmetric_memory_for_group(group_coordinator, disabled)
-    return SymmetricMemoryContext(group_coordinator) if enabled else nullcontext()
+    return SymmetricMemoryContext(group_coordinator)
