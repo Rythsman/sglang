@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 from contextlib import nullcontext
+from typing import Optional
 
 import torch
 import torch.utils.cpp_extension
@@ -17,6 +18,7 @@ after_2_8_0 = version.parse(torch.__version__) >= version.parse("2.8.0")
 nccl_allocator_source = """
 
 #include <cuda_runtime.h>
+#include <stdlib.h>
 
 extern "C" {
 
@@ -43,8 +45,18 @@ void* nccl_alloc_plug(size_t size, int device, void* stream) {
   ncclResult_t err = ncclMemAlloc(&ptr, size);
 
   const char *str_val = getenv("SGLANG_TMP_NCCL_COMM_VALUE");
+  if (str_val == NULL || str_val[0] == '\\0') {
+    // Fallback: return the allocation without symmetric registration.
+    // This avoids undefined behavior in strtoull and prevents hard hangs when
+    // the env var is not set (e.g. mis-nested contexts).
+    return ptr;
+  }
   char *endptr;
   void* int_val = (void *)strtoull(str_val, &endptr, 0);
+  if (endptr == str_val) {
+    // Invalid value; skip registration.
+    return ptr;
+  }
 
   ncclComm_t comm = (ncclComm_t)(int_val);
   ncclWindow_t win;
@@ -154,13 +166,19 @@ class SymmetricMemoryContext:
     ):
         self.group_coordinator = group_coordinator
         self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
-        self.is_graph_capture = torch.cuda.is_current_stream_capturing()
+        # NOTE: Determine capture mode at __enter__ time to reflect the actual
+        # current stream context (graph capture switches streams).
+        self.is_graph_capture = False
         self.exited = False
+        self._prev_nccl_comm_env: Optional[str] = None
+        self._had_prev_nccl_comm_env: bool = False
 
     def __enter__(self):
         assert (
             self.group_coordinator.pynccl_comm is not None
         ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.group_name}'"
+
+        self.is_graph_capture = torch.cuda.is_current_stream_capturing()
 
         if self.is_graph_capture:
             assert (
@@ -181,6 +199,8 @@ class SymmetricMemoryContext:
         self._mem_pool_ctx.__enter__()
 
         # Set the env var to pass this argument to the C functions.
+        self._prev_nccl_comm_env = os.environ.get("SGLANG_TMP_NCCL_COMM_VALUE")
+        self._had_prev_nccl_comm_env = "SGLANG_TMP_NCCL_COMM_VALUE" in os.environ
         os.environ["SGLANG_TMP_NCCL_COMM_VALUE"] = str(
             self.group_coordinator.pynccl_comm.comm.value
         )
@@ -220,6 +240,13 @@ class SymmetricMemoryContext:
                 )
             else:
                 torch._C._cuda_beginAllocateToPool(_cur_device, _graph_pool_id)
+
+        # Restore env var to support nested/overlapping symmetric memory contexts.
+        if self._had_prev_nccl_comm_env:
+            assert self._prev_nccl_comm_env is not None
+            os.environ["SGLANG_TMP_NCCL_COMM_VALUE"] = self._prev_nccl_comm_env
+        else:
+            os.environ.pop("SGLANG_TMP_NCCL_COMM_VALUE", None)
 
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = None
