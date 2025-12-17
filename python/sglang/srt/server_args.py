@@ -3871,9 +3871,12 @@ class ServerArgs:
         )
         parser.add_argument(
             "--mm-per-request-timeout",
-            type=int,
+            type=float,
             default=ServerArgs.mm_per_request_timeout,
-            help="The timeout for each multi-modal request in seconds.",
+            help=(
+                "The timeout for each multi-modal request in seconds. "
+                "Set to <= 0 to disable."
+            ),
         )
         parser.add_argument(
             "--enable-broadcast-mm-inputs-process",

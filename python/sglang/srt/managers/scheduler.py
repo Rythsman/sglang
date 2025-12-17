@@ -150,7 +150,14 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    ReqTraceStatus,
+    get_trace_manager,
+    trace_req_begin,
+    trace_req_end,
+    validate_input_length,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -1101,6 +1108,15 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+
+                if get_trace_manager() is not None:
+                    for req in recv_reqs:
+                        if isinstance(
+                            req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        ):
+                            trace_req_end(req.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+                            trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
+
             else:
                 recv_reqs = None
         else:
@@ -1465,6 +1481,11 @@ class Scheduler(
         """Handle optimized batch generate request."""
         logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
 
+        if get_trace_manager() is not None:
+            for tokenized_req in recv_req:
+                trace_req_end(tokenized_req.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+                trace_req_begin(tokenized_req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
+
         # Process each request in the batch
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
@@ -1502,6 +1523,12 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
+            if is_retracted:
+                trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_DECODE)
+                trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
+            else:
+                trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
+                trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1639,6 +1666,11 @@ class Scheduler(
         logger.debug(
             f"Processing batch embedding request with {len(recv_req)} requests"
         )
+
+        if get_trace_manager() is not None:
+            for tokenized_req in recv_req:
+                trace_req_end(tokenized_req.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+                trace_req_begin(tokenized_req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
 
         # Process each request in the batch
         for tokenized_req in recv_req:
@@ -1845,6 +1877,9 @@ class Scheduler(
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
                 req.add_latency(RequestStage.PREFILL_WAITING)
+                if req in self.waiting_queue:
+                    trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
+                    trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_PREFILL)
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -2120,6 +2155,11 @@ class Scheduler(
                 self.process_batch_result_dllm(batch, result)
             else:
                 self.process_batch_result_prefill(batch, result)
+                # if self.attn_tp_rank == 0 and (
+                #     obj := self.tp_worker.get_mm_run_time_metrics()
+                # ):
+                #     self.send_to_tokenizer.send_output(obj)
+
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
@@ -2457,7 +2497,7 @@ class Scheduler(
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
-                    self._add_request_to_queue(req)
+                    self._add_request_to_queue(req, is_retracted=True)
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None
