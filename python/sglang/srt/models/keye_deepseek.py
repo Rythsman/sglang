@@ -13,7 +13,6 @@ from transformers.utils import torch_int
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.activation import QuickGELU, get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -35,6 +34,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.utils import add_prefix, print_info_once
+from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _TP_RANK_DEFAULT = 0
 _TP_SIZE_DEFAULT = 1
