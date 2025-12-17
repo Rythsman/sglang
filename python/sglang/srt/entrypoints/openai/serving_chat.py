@@ -216,6 +216,8 @@ class OpenAIServingChat(OpenAIServingBase):
             priority=request.priority,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            image_processor_config=processed_messages.image_processor_config_merged,
+            video_processor_config=processed_messages.video_processor_config_merged,
         )
 
         return adapted_request, request
@@ -279,6 +281,8 @@ class OpenAIServingChat(OpenAIServingBase):
         video_data = []
         audio_data = []
         modalities = []
+        image_processor_config_merged = {}
+        video_processor_config_merged = {}
 
         template_content_format = self.template_manager.jinja_template_content_format
 
@@ -315,6 +319,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     video_data,
                     audio_data,
                     modalities,
+                    image_processor_config_merged,
+                    video_processor_config_merged,
                 )
 
                 # per the Transformers docs & maintainers, tool call arguments in
@@ -399,6 +405,12 @@ class OpenAIServingChat(OpenAIServingBase):
         audio_data = audio_data if audio_data else None
         video_data = video_data if video_data else None
         modalities = modalities if modalities else []
+        image_processor_config_merged = (
+            image_processor_config_merged if image_processor_config_merged else None
+        )
+        video_processor_config_merged = (
+            video_processor_config_merged if video_processor_config_merged else None
+        )
         return MessageProcessingResult(
             prompt=prompt,
             prompt_ids=prompt_ids,
@@ -407,6 +419,8 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            image_processor_config_merged=image_processor_config_merged,
+            video_processor_config_merged=video_processor_config_merged,
         )
 
     def _apply_conversation_template(

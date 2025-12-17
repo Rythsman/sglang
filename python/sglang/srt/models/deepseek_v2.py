@@ -3413,7 +3413,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
         disable_reason = None
         if (
-            self.config.architectures[0] != architecture
+            (
+                self.config.architectures[0] != architecture
+                and self.config.architectures[0] != "KeyeVLMoeForConditionalGeneration"
+            )
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
@@ -3794,7 +3797,14 @@ class DeepseekV2ForCausalLM(nn.Module):
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        load_exec_max_workers = get_int_env_var(
+            "SGLANG_LOAD_WEIGHTS_EXECUTOR_MAX_WORKERS", 0
+        )
+        executor_kwargs = {}
+        if load_exec_max_workers > 0:
+            executor_kwargs["max_workers"] = load_exec_max_workers
+
+        with concurrent.futures.ThreadPoolExecutor(**executor_kwargs) as executor:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []
@@ -4011,6 +4021,11 @@ class DeepseekV2ForCausalLM(nn.Module):
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+
+        if torch.cuda.is_available() and get_bool_env_var(
+            "SGLANG_WEIGHT_LOAD_NON_BLOCKING"
+        ):
+            torch.cuda.synchronize()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
