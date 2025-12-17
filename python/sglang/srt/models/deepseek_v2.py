@@ -2572,11 +2572,12 @@ class DeepseekV2AttentionMLA(nn.Module):
     def _all_gather_dcp_kv_cache(self, kv_a):
         dcp_world_size = get_dcp_world_size()
         dcp_rank = get_dcp_rank()
-        gathered_kv_a = torch.zeros(
-            (kv_a.shape[0] * get_dcp_world_size(), *kv_a.shape[1:]),
-            dtype=kv_a.dtype,
-            device=kv_a.device,
-        )
+        with use_symmetric_memory(get_dcp_group()):
+            gathered_kv_a = torch.zeros(
+                (kv_a.shape[0] * get_dcp_world_size(), *kv_a.shape[1:]),
+                dtype=kv_a.dtype,
+                device=kv_a.device,
+            )
         idxs = torch.arange(kv_a.shape[0] * dcp_world_size)
         mask = idxs % dcp_world_size == dcp_rank
         gathered_kv_a[mask] = kv_a
