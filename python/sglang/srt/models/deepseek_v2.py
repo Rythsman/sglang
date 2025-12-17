@@ -3413,7 +3413,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
         disable_reason = None
         if (
-            self.config.architectures[0] != architecture
+            (
+                self.config.architectures[0] != architecture
+                and self.config.architectures[0] != "KeyeVLMoeForConditionalGeneration"
+            )
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):

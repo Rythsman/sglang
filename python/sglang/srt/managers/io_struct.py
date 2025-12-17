@@ -227,6 +227,11 @@ class GenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # Image processor config
+    image_processor_config: Optional[dict] = None
+    # Video processor config
+    video_processor_config: Optional[dict] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -628,6 +633,8 @@ class GenerateReqInput(BaseReq):
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             http_worker_ipc=self.http_worker_ipc,
+            image_processor_config=self.image_processor_config,
+            video_processor_config=self.video_processor_config,
         )
 
 
