@@ -19,6 +19,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sglang.srt.managers.trace_utils import (
+    BatchTraceStatus,
+    trace_batch_begin,
+    trace_batch_end,
+)
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -385,7 +390,21 @@ def _get_chunked_prefill_embedding(
         embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
         embedding_per_req = embedding_cache.get(item_hashes)
         if embedding_per_req is None:
+            trace_batch_begin(
+                "ReqEmbedding",
+                extra_info={
+                    "hash": embedding_items_hash,
+                    "modality": embedding_items_per_req[0].modality.name,
+                    "num_items": len(embedding_items_per_req),
+                },
+                tid="req_embedding",
+            )
             embedding_per_req = data_embedding_func(embedding_items_per_req)
+            trace_batch_end(
+                "ReqEmbedding",
+                tid="req_embedding",
+                extra_info={"embedding_shape": embedding_per_req.shape},
+            )
             if not embedding_cache.set(embedding_items_hash, embedding_per_req):
                 print_warning_once(
                     "Multimodal embedding cache is full. This typically occurs when a single "
@@ -695,6 +714,9 @@ def general_mm_embed_routine(
                     for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                     if forward_batch.mm_inputs[i] is not None
                 ]
+                trace_batch_begin(
+                    BatchTraceStatus.ENCODER, tid="general_mm_embed_routine"
+                )
                 input_embeds, other_info = embed_mm_inputs(
                     mm_inputs_list=mm_inputs_list,
                     extend_prefix_lens=extend_prefix_lens,
@@ -705,6 +727,9 @@ def general_mm_embed_routine(
                     data_embedding_func_mapping=data_embedding_funcs,
                     placeholder_tokens=placeholder_tokens,
                     use_deepstack=use_deepstack,
+                )
+                trace_batch_end(
+                    BatchTraceStatus.ENCODER, tid="general_mm_embed_routine"
                 )
                 # add for qwen3_vl deepstack
                 if use_deepstack:
@@ -723,12 +748,14 @@ def general_mm_embed_routine(
         else:
             input_embeds = None
 
+    trace_batch_begin(forward_batch.forward_mode, tid="general_mm_embed_routine")
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
         input_embeds=input_embeds,
         **kwargs,
     )
+    trace_batch_end(forward_batch.forward_mode, tid="general_mm_embed_routine")
     return hidden_states
 
 

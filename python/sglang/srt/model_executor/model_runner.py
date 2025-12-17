@@ -103,6 +103,11 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.trace_utils import (
+    trace_batch_begin,
+    trace_batch_end,
+    trace_global_stats,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     DcpTokenToKVPoolAllocator,
@@ -551,6 +556,16 @@ class ModelRunner:
                 # if there is no aux layer, set to None
                 eagle_aux_hidden_state_layer_ids = None
 
+            trace_global_stats(
+                {
+                    "after_init_attention_backend(GB)": get_available_gpu_memory(
+                        self.device,
+                        self.gpu_id,
+                        empty_cache=False,
+                    )
+                }
+            )
+
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
         # Initialize piecewise CUDA graph
@@ -652,6 +667,9 @@ class ModelRunner:
             backend = "hccl"
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        trace_global_stats(
+            {"before_init_torch_distributed_memory(GB)": before_avail_memory}
+        )
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
@@ -731,6 +749,13 @@ class ModelRunner:
         logger.info(
             f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
+        trace_global_stats(
+            {
+                "after_init_torch_distributed_memory(GB)": local_gpu_memory,
+                "init_torch_distributed_memory(GB)": before_avail_memory
+                - local_gpu_memory,
+            }
+        )
         return min_per_gpu_memory
 
     def load_model(self):
@@ -738,6 +763,7 @@ class ModelRunner:
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+        trace_global_stats({"before_load_model(GB)": before_avail_memory})
 
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
@@ -862,6 +888,12 @@ class ModelRunner:
             f"dtype={self.dtype}, "
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
+        )
+        trace_global_stats(
+            {
+                "after_load_model(GB)": after_avail_memory,
+                "weight_load_mem_usage(GB)": self.weight_load_mem_usage,
+            }
         )
         if self.server_args.debug_tensor_dump_output_folder is not None:
             register_forward_hook_for_model(
@@ -1814,6 +1846,13 @@ class ModelRunner:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
 
+        trace_global_stats(
+            {
+                "req_to_token_pool_size": self.req_to_token_pool.size,
+                "max_context_len": self.req_to_token_pool.max_context_len,
+            }
+        )
+
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         if self.server_args.attention_backend == "ascend":
@@ -1991,6 +2030,8 @@ class ModelRunner:
                         ),
                     )
 
+        trace_global_stats({"token_to_kv_pool_size": self.token_to_kv_pool.size})
+
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if self.token_to_kv_pool_allocator is None:
@@ -2068,10 +2109,9 @@ class ModelRunner:
         else:
             assert self.is_draft_worker
 
-        logger.info(
-            f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
+        available_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(f"Memory pool end. " f"avail mem={available_gpu_memory:.2f} GB")
+        trace_global_stats({"after_init_memory_pool(GB)": available_gpu_memory})
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
@@ -2487,6 +2527,12 @@ class ModelRunner:
             f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+        trace_global_stats(
+            {
+                f"after_capture_graph_memory(GB)": after_mem,
+                f"capture_graph_usage(GB)": self.graph_mem_usage,
+            }
+        )
 
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""
@@ -2818,6 +2864,15 @@ class ModelRunner:
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
+        trace_batch_begin(
+            forward_batch.forward_mode,
+            extra_info={
+                "batch_size": forward_batch.batch_size,
+                "extend_num_tokens": forward_batch.extend_num_tokens,
+            },
+            tid="ModelRunner::forward",
+        )
+
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
@@ -2832,6 +2887,12 @@ class ModelRunner:
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
+
+        trace_batch_end(
+            forward_batch.forward_mode,
+            tid="ModelRunner::forward",
+            extra_info={"can_run_graph": output[1]},
+        )
 
         return output
 
@@ -3024,6 +3085,13 @@ class ModelRunner:
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
+
+    # def get_mm_run_time_metrics(self):
+    #     return (
+    #         self.model.get_mm_run_time_metrics()
+    #         if getattr(self.model, "get_mm_run_time_metrics", None)
+    #         else None
+    #     )
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

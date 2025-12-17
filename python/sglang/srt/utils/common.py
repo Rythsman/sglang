@@ -94,6 +94,7 @@ from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.trace_utils import trace_execution_time
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 if TYPE_CHECKING:
@@ -1211,6 +1212,7 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+@trace_execution_time()
 def broadcast_pyobj(
     data: List[Any],
     rank: int,

@@ -22,7 +22,7 @@ import threading
 import time
 from collections import deque
 from concurrent import futures
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -150,6 +150,13 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
+from sglang.srt.managers.trace_utils import (
+    ReqTraceStatus,
+    get_trace_manager,
+    trace_global_stats,
+    trace_req_begin,
+    trace_req_end,
+)
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -271,6 +278,7 @@ class Scheduler(
             server_args.speculative_algorithm
         )
         self.gpu_id = gpu_id
+        trace_global_stats({"gpu_id": gpu_id})
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
@@ -368,6 +376,17 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        trace_global_stats(
+            {
+                "max_total_num_tokens": self.max_total_num_tokens,
+                "max_prefill_tokens": self.max_prefill_tokens,
+                "max_running_requests": self.max_running_requests,
+                "max_queued_requests": self.max_queued_requests,
+                "max_req_len": self.max_req_len,
+                "max_req_input_len": self.max_req_input_len,
+                "device": self.device,
+            }
+        )
         if get_global_server_args().pp_max_micro_batch_size is None:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // server_args.pp_size, 1
@@ -464,6 +483,12 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
+        trace_global_stats(
+            {
+                "chunked_prefill_size": self.chunked_prefill_size,
+                "is_mixed_chunk": self.is_mixed_chunk,
+            }
+        )
 
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
@@ -539,6 +564,7 @@ class Scheduler(
         # Init mlp sync flag
         self.require_mlp_sync = require_mlp_sync(server_args)
 
+        trace_global_stats({"server_args": asdict(self.server_args)})
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -823,6 +849,7 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+        trace_global_stats({"embedding_cache_size_MB": embedding_cache_size})
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
@@ -1101,6 +1128,15 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+
+                if get_trace_manager() is not None:
+                    for req in recv_reqs:
+                        if isinstance(
+                            req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        ):
+                            trace_req_end(req.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+                            trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
+
             else:
                 recv_reqs = None
         else:
@@ -1465,6 +1501,11 @@ class Scheduler(
         """Handle optimized batch generate request."""
         logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
 
+        if get_trace_manager() is not None:
+            for tokenized_req in recv_req:
+                trace_req_end(tokenized_req.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+                trace_req_begin(tokenized_req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
+
         # Process each request in the batch
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
@@ -1502,6 +1543,12 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
+            if is_retracted:
+                trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_DECODE)
+                trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
+            else:
+                trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
+                trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1639,6 +1686,11 @@ class Scheduler(
         logger.debug(
             f"Processing batch embedding request with {len(recv_req)} requests"
         )
+
+        if get_trace_manager() is not None:
+            for tokenized_req in recv_req:
+                trace_req_end(tokenized_req.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+                trace_req_begin(tokenized_req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
 
         # Process each request in the batch
         for tokenized_req in recv_req:
@@ -1845,6 +1897,9 @@ class Scheduler(
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
                 req.add_latency(RequestStage.PREFILL_WAITING)
+                if req in self.waiting_queue:
+                    trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
+                    trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_PREFILL)
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -2120,6 +2175,11 @@ class Scheduler(
                 self.process_batch_result_dllm(batch, result)
             else:
                 self.process_batch_result_prefill(batch, result)
+                # if self.attn_tp_rank == 0 and (
+                #     obj := self.tp_worker.get_mm_run_time_metrics()
+                # ):
+                #     self.send_to_tokenizer.send_output(obj)
+
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
@@ -2457,7 +2517,7 @@ class Scheduler(
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
-                    self._add_request_to_queue(req)
+                    self._add_request_to_queue(req, is_retracted=True)
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None

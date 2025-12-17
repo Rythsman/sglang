@@ -11,6 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
+from sglang.srt.managers.trace_utils import ReqTraceStatus, trace_req_end, trace_usage
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
 
@@ -153,6 +154,18 @@ class SchedulerMetricsMixin:
 
         logger.info(f)
 
+        trace_usage(
+            "Prefill Batch",
+            {
+                "num_new_seq": len(can_run_list),
+                "new_token": adder.log_input_tokens,
+                "cached_token": adder.log_hit_tokens,
+                "token_usage": token_usage,
+                "queue_req": len(self.waiting_queue),
+                "running_bs": running_bs,
+            },
+        )
+
         if self.enable_metrics:
             # Basics
             total_tokens = adder.log_input_tokens + adder.log_hit_tokens
@@ -173,6 +186,9 @@ class SchedulerMetricsMixin:
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
+
+            for req in can_run_list:
+                trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -354,6 +370,15 @@ class SchedulerMetricsMixin:
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()
+
+        trace_usage(
+            "Decode Batch",
+            {
+                "num_running_reqs": num_running_reqs,
+                "token_usage": token_usage,
+                "queue_req": len(self.waiting_queue),
+            },
+        )
 
     def _emit_kv_metrics(self: Scheduler):
         if not self.enable_kv_cache_events:

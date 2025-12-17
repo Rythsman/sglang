@@ -189,6 +189,8 @@ class Engine(EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
         rid: Optional[Union[List[str], str]] = None,
+        image_processor_config: Optional[dict] = None,
+        video_processor_config: Optional[dict] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -224,6 +226,8 @@ class Engine(EngineBase):
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
             rid=rid,
+            image_processor_config=image_processor_config,
+            video_processor_config=video_processor_config,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -271,6 +275,8 @@ class Engine(EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
         rid: Optional[Union[List[str], str]] = None,
+        image_processor_config: Optional[dict] = None,
+        video_processor_config: Optional[dict] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -308,6 +314,8 @@ class Engine(EngineBase):
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
             rid=rid,
+            image_processor_config=image_processor_config,
+            video_processor_config=video_processor_config,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
