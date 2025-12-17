@@ -103,6 +103,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.utils import trace_batch_begin, trace_batch_end
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     DcpTokenToKVPoolAllocator,
@@ -2818,6 +2819,15 @@ class ModelRunner:
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
+        trace_batch_begin(
+            forward_batch.forward_mode,
+            extra_info={
+                "batch_size": forward_batch.batch_size,
+                "extend_num_tokens": forward_batch.extend_num_tokens,
+            },
+            tid="ModelRunner::forward",
+        )
+
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
@@ -2833,6 +2843,7 @@ class ModelRunner:
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
 
+        trace_batch_end(forward_batch.forward_mode, tid="ModelRunner::forward")
         return output
 
     def _forward_raw(
@@ -3024,6 +3035,13 @@ class ModelRunner:
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
+
+    # def get_mm_run_time_metrics(self):
+    #     return (
+    #         self.model.get_mm_run_time_metrics()
+    #         if getattr(self.model, "get_mm_run_time_metrics", None)
+    #         else None
+    #     )
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

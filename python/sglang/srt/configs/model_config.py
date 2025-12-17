@@ -338,6 +338,7 @@ class ModelConfig:
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "MistralLarge3ForCausalLM" in self.hf_config.architectures
             or "PixtralForConditionalGeneration" in self.hf_config.architectures
+            or "KeyeVLMoeForConditionalGeneration" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -963,6 +964,7 @@ multimodal_model_archs = [
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
     "JetVLMForConditionalGeneration",
+    "KeyeVLMoeForConditionalGeneration",
 ]
 
 if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:

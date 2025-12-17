@@ -200,6 +200,9 @@ class BaseTpWorker(ABC):
         embeddings = logits_output.embeddings
         return embeddings
 
+    # def get_mm_run_time_metrics(self):
+    #     return self.model_runner.get_mm_run_time_metrics()
+
 
 class TpModelWorker(BaseTpWorker):
     """A tensor parallel model worker."""
