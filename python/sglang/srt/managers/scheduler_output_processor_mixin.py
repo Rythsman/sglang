@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.managers.utils import ReqTraceStatus, trace_req_begin, trace_req_end
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
@@ -107,6 +108,13 @@ class SchedulerOutputProcessorMixin:
                     continue
 
                 if req.is_chunked <= 0:
+                    if len(req.output_ids) == 0:
+                        trace_req_end(
+                            req.rid,
+                            ReqTraceStatus.SCHEDULER_PREFILL,
+                            extra_info={"prompt_tokens": len(req.origin_input_ids)},
+                        )
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     req.check_finished()
@@ -114,9 +122,17 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
+                        if batch.decoding_reqs and req in batch.decoding_reqs:
+                            trace_req_end(
+                                req.rid,
+                                ReqTraceStatus.SCHEDULER_DECODE,
+                                extra_info={"completion_tokens": len(req.output_ids)},
+                            )
+
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
+                        trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_DECODE)
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
@@ -362,6 +378,13 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
+                trace_req_end(
+                    req.rid,
+                    ReqTraceStatus.SCHEDULER_DECODE,
+                    extra_info={"completion_tokens": len(req.output_ids)},
+                )
+                trace_req_begin(req.rid, ReqTraceStatus.POST_SCHEDULER)
+
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
