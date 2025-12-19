@@ -131,13 +131,13 @@ class SchedulerProfilerMixin:
         if "CUSTOM_PROFILER" in activities:
             prefix = f"{profile_id}"
             if self.dp_rank is not None:
-                prefix += f"DP{self.dp_rank}-"
+                prefix += f"-DP-{self.dp_rank}-"
             if self.tp_size > 1:
-                prefix += f"TP{self.tp_rank}-"
+                prefix += f"-TP-{self.tp_rank}-"
             if self.moe_ep_rank > 1:
-                prefix += f"EP{self.moe_ep_rank}-"
+                prefix += f"-EP-{self.moe_ep_rank}-"
             if self.pp_rank > 1:
-                prefix += f"PP{self.pp_rank}-"
+                prefix += f"-PP-{self.pp_rank}-"
 
             init_tracing_manager(prefix, output_dir)
 

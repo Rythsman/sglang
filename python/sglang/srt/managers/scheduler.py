@@ -2128,7 +2128,7 @@ class Scheduler(
                 if self.attn_tp_rank == 0 and (
                     obj := self.tp_worker.get_mm_run_time_metrics()
                 ):
-                    self.send_to_tokenizer.send_pyobj(obj)
+                    self.send_to_tokenizer.send_output(obj)
 
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
