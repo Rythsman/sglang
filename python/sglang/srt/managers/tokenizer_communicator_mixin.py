@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -70,6 +71,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.utils import dump_tracing_events, init_tracing_manager
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
@@ -328,6 +330,11 @@ class TokenizerCommunicatorMixin:
         profile_stages: Optional[List[str]] = None,
     ):
         self.auto_create_handle_loop()
+        if activities and "CUSTOM_PROFILER" in activities:
+            if output_dir is None:
+                output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+            init_tracing_manager("tm_", output_dir)
+
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
         with_stack = False if with_stack is False or env_with_stack is False else True
         env_record_shapes: bool = get_bool_env_var(
@@ -359,6 +366,8 @@ class TokenizerCommunicatorMixin:
         result = (await self.profile_communicator(req))[0]
         if not result.success:
             raise RuntimeError(result.message)
+        if req.type == ProfileReqType.STOP_PROFILE:
+            dump_tracing_events()
         return result
 
     async def start_expert_distribution_record(self: TokenizerManager):
