@@ -244,8 +244,8 @@ def trace_req(rid: int, state: ReqState, extra_info: Dict[Any, Any]):
                 "track_id": "prefill",
                 "prompt_tokens": prompt_tokens,
                 "throughput": prompt_tokens
-                / (state.first_token_time - state.created_time)
-                ** (state.mm_info or {}),
+                / (state.first_token_time - state.created_time),
+                **(state.mm_info or {}),
             },
         }
     )
