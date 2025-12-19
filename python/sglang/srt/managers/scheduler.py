@@ -150,7 +150,11 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    trace_profile,
+    validate_input_length,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -1965,6 +1969,7 @@ class Scheduler(
     ):
         pass
 
+    @trace_profile("run_batch")
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -2120,6 +2125,11 @@ class Scheduler(
                 self.process_batch_result_dllm(batch, result)
             else:
                 self.process_batch_result_prefill(batch, result)
+                if self.attn_tp_rank == 0 and (
+                    obj := self.tp_worker.get_mm_run_time_metrics()
+                ):
+                    self.send_to_tokenizer.send_pyobj(obj)
+
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():

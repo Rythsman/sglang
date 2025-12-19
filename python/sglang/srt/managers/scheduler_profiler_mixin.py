@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
+from sglang.srt.managers.utils import dump_tracing_events, init_tracing_manager
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
@@ -127,6 +128,19 @@ class SchedulerProfilerMixin:
         else:
             self.profiler_target_forward_ct = None
 
+        if "CUSTOM_PROFILER" in activities:
+            prefix = f"{profile_id}"
+            if self.dp_rank is not None:
+                prefix += f"DP{self.dp_rank}-"
+            if self.tp_size > 1:
+                prefix += f"TP{self.tp_rank}-"
+            if self.moe_ep_rank > 1:
+                prefix += f"EP{self.moe_ep_rank}-"
+            if self.pp_rank > 1:
+                prefix += f"PP{self.pp_rank}-"
+
+            init_tracing_manager(prefix, output_dir)
+
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def start_profile(
@@ -204,6 +218,9 @@ class SchedulerProfilerMixin:
         if "CUDA_PROFILER" in activities:
             if self.gpu_id == get_global_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStart()
+            self.profile_in_progress = True
+
+        if "CUSTOM_PROFILER" in activities:
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -314,6 +331,9 @@ class SchedulerProfilerMixin:
         if "CUDA_PROFILER" in self.profiler_activities:
             if self.gpu_id == get_global_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
+
+        if "CUSTOM_PROFILER" in self.profiler_activities:
+            dump_tracing_events()
 
         merge_message = self._merge_profile_traces()
 

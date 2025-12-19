@@ -2,6 +2,7 @@ import asyncio
 import collections
 import math
 import re
+import time
 from typing import Dict, List, Tuple, Union
 
 import cv2
@@ -488,6 +489,8 @@ class KeyeImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
 
+        start_time = time.time()
+
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -495,6 +498,8 @@ class KeyeImageProcessor(SGLangBaseProcessor):
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
         )
+
+        load_time = time.time()
 
         # keye-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
@@ -528,6 +533,8 @@ class KeyeImageProcessor(SGLangBaseProcessor):
                         continue
                     videos_kwargs[k].append(v)
 
+        preprocess_time = time.time()
+
         if base_output.videos and videos_kwargs:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output,
@@ -539,6 +546,8 @@ class KeyeImageProcessor(SGLangBaseProcessor):
                 base_output,
                 self.mm_tokens,
             )
+
+        process_time = time.time()
 
         input_ids = input_ids.flatten()
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_keye(
@@ -554,6 +563,8 @@ class KeyeImageProcessor(SGLangBaseProcessor):
         )
         mrope_positions = mrope_positions.squeeze(1)
 
+        final_time = time.time()
+
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
@@ -564,4 +575,8 @@ class KeyeImageProcessor(SGLangBaseProcessor):
             "audio_token_id": self.mm_tokens.audio_token_id,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
+            "mm_load_time": load_time - start_time,
+            "mm_preprocess_time": preprocess_time - load_time,
+            "mm_process_time": process_time - preprocess_time,
+            "mm_total_time": final_time - start_time,
         }

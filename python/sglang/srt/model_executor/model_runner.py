@@ -3025,6 +3025,13 @@ class ModelRunner:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
 
+    def get_mm_run_time_metrics(self):
+        return (
+            self.model.get_mm_run_time_metrics()
+            if getattr(self.model, "get_mm_run_time_metrics", None)
+            else None
+        )
+
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())

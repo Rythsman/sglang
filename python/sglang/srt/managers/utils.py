@@ -1,18 +1,29 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
+import gzip
+import json
 import logging
-from typing import TYPE_CHECKING, List, Optional
+import os
+import time
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+import psutil
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import (
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.managers.tokenizer_manager import ReqState
     from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 
@@ -168,3 +179,174 @@ def get_logprob_from_pp_outputs(
     ]
 
     return logits_output, extend_input_len_per_req, extend_logprob_start_len_per_req
+
+
+class TracingManager:
+    def __init__(self, prefix: str, output_dir: str):
+        # file_name = f"{prefix}custom_profiler.chrome_trace.json"
+        file_name = f"{prefix}custom_profiler.trace.json.gz"
+        self.output_path = os.path.join(output_dir, file_name)
+        self.events = []
+        self.pid = psutil.Process().name()
+
+        logger.info(f"Tracing events will be dumped to {self.output_path}")
+
+    def dump_events(self):
+        logger.info(f"Dumpping events to {self.output_path}")
+        if self.output_path.endswith(".gz"):
+            with gzip.open(self.output_path, "wt") as f:
+                f.write(json.dumps(self.events, indent=4, separators=(",", ":")))
+        else:
+            with open(self.output_path, "w") as f:
+                f.write(json.dumps(self.events, indent=4, separators=(",", ":")))
+        logger.info(f"Dump events({len(self.events)}) finished")
+        self.events = []
+
+    def append(self, event: dict):
+        self.events.append(event)
+
+
+tracing_manager: Optional[TracingManager] = None
+
+
+def init_tracing_manager(prefix: str, output_dir: str):
+    global tracing_manager
+    if tracing_manager is None:
+        tracing_manager = TracingManager(prefix, output_dir)
+
+
+def dump_tracing_events():
+    global tracing_manager
+    if tracing_manager is not None:
+        tracing_manager.dump_events()
+
+
+def trace_req(rid: int, state: ReqState, extra_info: Dict[Any, Any]):
+    global tracing_manager
+    if tracing_manager is None:
+        return
+
+    prompt_tokens = extra_info["meta_info"]["prompt_tokens"]
+    create_time = int(state.created_time * 1000000.0)
+    first_token_time = int(state.first_token_time * 1000000.0)
+    finished_time = int(state.finished_time * 1000000.0)
+
+    tracing_manager.append(
+        {
+            "cat": f"req_{rid}",
+            "name": f"req_{rid}_prefill",
+            "ts": create_time,
+            "dur": first_token_time - create_time,
+            "ph": "X",
+            "pid": tracing_manager.pid,
+            "tid": rid,
+            "args": {
+                "track_id": "prefill",
+                "prompt_tokens": prompt_tokens,
+                "throughput": prompt_tokens
+                / (state.first_token_time - state.created_time)
+                ** (state.mm_info or {}),
+            },
+        }
+    )
+
+    if len(state.output_ids) <= 1:
+        return
+
+    tracing_manager.append(
+        {
+            "cat": f"req_{rid}",
+            "name": f"req_{rid}_decode",
+            "ts": first_token_time + 1,
+            "dur": finished_time - first_token_time,
+            "ph": "X",
+            "pid": tracing_manager.pid,
+            "tid": rid,
+            "args": {
+                "track_id": "decode",
+                "output_tokens": len(state.output_ids),
+                "throughput": len(state.output_ids)
+                / (state.finished_time - state.first_token_time),
+            },
+        }
+    )
+
+
+class TracingProfiler:
+    def __init__(
+        self,
+        name: str,
+        forward_batch: Union[ForwardBatch, ScheduleBatch] = None,
+        extra_data: dict = {},
+    ):
+        if forward_batch is None and extra_data.get("args", None) is not None:
+            forward_batch = extra_data["args"][1]
+
+        self.batch = forward_batch
+        self.start_time: Optional[float] = None
+        self.name = f"{name}_{self.batch.forward_mode.name}"
+        self.extra_data = extra_data
+
+    @property
+    def batch_size(self):
+        if isinstance(self.batch, ScheduleBatch):
+            return self.batch.batch_size()
+        return self.batch.batch_size
+
+    def __enter__(self):
+        self.start_time = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global tracing_manager
+        if tracing_manager is None:
+            return
+        end_time = time.time()
+        duration = end_time - self.start_time
+        tracing_manager.append(
+            {
+                "cat": self.name,
+                "name": self.name,
+                "ts": self.start_time * 1000000.0,
+                "dur": duration * 1000000.0,
+                "ph": "X",
+                "pid": tracing_manager.pid,
+                "args": {
+                    "batch_size": self.batch_size,
+                },
+            }
+        )
+
+
+def trace_profile(name: str):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            extra_data = {
+                "args": args,
+                "kwargs": kwargs,
+            }
+            with TracingProfiler(name, extra_data=extra_data):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def extract_mm_info(
+    tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+):
+    result = {
+        "mm_load_time(ms)": tokenized_obj.mm_inputs["mm_load_time"] * 1000.0,
+        "mm_preprocess_time(ms)": tokenized_obj.mm_inputs["mm_preprocess_time"]
+        * 1000.0,
+        "mm_process_time(ms)": tokenized_obj.mm_inputs["mm_process_time"] * 1000.0,
+        "mm_total_time(ms)": tokenized_obj.mm_inputs["mm_total_time"] * 1000.0,
+    }
+
+    for item in tokenized_obj.mm_inputs["mm_items"]:
+        result[item.modality.name] = {
+            "offsets": item.offsets,
+        }
+    return result

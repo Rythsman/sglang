@@ -1619,6 +1619,32 @@ class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
 
 
+# TODO(wh): move to other path
+@dataclass
+class MultimodalRunTimeMetrics:
+    video_run_times: List[float] = field(default_factory=list)
+    image_run_times: Optional[List[float]] = field(default_factory=list)
+    image_tokens: List[int] = field(default_factory=list)
+    video_tokens: List[int] = field(default_factory=list)
+
+    def log_image(self, run_time: float, tokens: int):
+        self.image_run_times.append(run_time)
+        self.image_tokens.append(tokens)
+
+    def log_video(self, run_time: float, tokens: int):
+        self.video_run_times.append(run_time)
+        self.video_tokens.append(tokens)
+
+    def reset(self):
+        self.video_run_times = []
+        self.image_run_times = []
+        self.image_tokens = []
+        self.video_tokens = []
+
+    def __bool__(self):
+        return bool(self.image_run_times or self.video_run_times)
+
+
 def _check_all_req_types():
     """A helper function to check all request types are defined in this file."""
     import inspect
