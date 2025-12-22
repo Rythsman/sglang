@@ -1054,10 +1054,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
-
-        if obj.contains_mm_input():
-            state.mm_info = extract_mm_info(tokenized_obj)
-
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
         trace_slice_end(
