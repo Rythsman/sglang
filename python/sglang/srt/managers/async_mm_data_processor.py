@@ -46,6 +46,50 @@ def _mp_process_mm_data(
     )
 
 
+def _mp_process_mm_data_async_or_sync(
+    *,
+    image_data: Optional[List[Union[str, bytes]]],
+    audio_data: Optional[List[Union[str, bytes]]],
+    input_text_or_ids: Union[str, List[int], None],
+    request_obj: Any,
+    kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run async or sync mm processing in a child process."""
+    proc = _MP_MM_PROCESSOR
+    if proc is None:
+        raise RuntimeError("Multiprocess worker is not initialized.")
+
+    async_fn = getattr(proc, "process_mm_data_async", None)
+    if asyncio.iscoroutinefunction(async_fn):
+        return asyncio.run(
+            async_fn(
+                image_data=image_data,
+                audio_data=audio_data,
+                input_text=input_text_or_ids,
+                request_obj=request_obj,
+                **kwargs,
+            )
+        )
+
+    sync_fn = getattr(proc, "process_mm_data", None)
+    if not callable(sync_fn):
+        raise RuntimeError(
+            "mm_processor has neither 'process_mm_data_async' nor 'process_mm_data'."
+        )
+    return sync_fn(
+        image_data=image_data,
+        audio_data=audio_data,
+        input_text=input_text_or_ids,
+        request_obj=request_obj,
+        **kwargs,
+    )
+
+
+def _run_coroutine_in_new_loop(coro_fn: Callable[..., Any], call_kwargs: Dict[str, Any]):
+    """Run a coroutine function in a fresh event loop (executor thread)."""
+    return asyncio.run(coro_fn(**call_kwargs))
+
+
 def _default_mp_start_method() -> str:
     # Linux default is "fork". For CUDA workloads, "spawn" is usually safer.
     return "fork" if sys.platform.startswith("linux") else "spawn"
@@ -70,6 +114,7 @@ class AsyncMMDataProcessor:
         max_concurrent_calls: Optional[int] = None,
         timeout_s: Optional[float] = None,
         executor_backend: str = "thread",
+        force_executor_for_async: bool = False,
         mm_processor_factory: Optional[Callable[[], Any]] = None,
         mp_start_method: Optional[str] = None,
     ) -> None:
@@ -83,6 +128,10 @@ class AsyncMMDataProcessor:
             timeout_s: Optional timeout (seconds) for each `process()` call.
             executor_backend: Fallback executor backend for sync path.
                 Supported values: "thread" (default), "process".
+            force_executor_for_async: If True and mm_processor exposes a native async
+                `process_mm_data_async`, run it in the selected executor backend
+                instead of awaiting it directly. This enables multiprocess vs
+                multithread benchmarking even when an async implementation exists.
             mm_processor_factory: Optional zero-arg callable to build a fresh
                 mm_processor inside each child process when executor_backend="process".
                 The callable itself must be picklable (avoid lambdas / nested defs).
@@ -92,6 +141,7 @@ class AsyncMMDataProcessor:
         self.mm_processor = mm_processor
         self.timeout_s = timeout_s
         self.executor_backend = executor_backend
+        self.force_executor_for_async = force_executor_for_async
         self.mm_processor_factory = mm_processor_factory
         self.mp_start_method = mp_start_method or _default_mp_start_method()
 
@@ -104,7 +154,7 @@ class AsyncMMDataProcessor:
         self._proc_async = getattr(mm_processor, "process_mm_data_async", None)
         self.is_async = asyncio.iscoroutinefunction(self._proc_async)
         self.fallback_exec: Optional[Executor] = None
-        if not self.is_async:
+        if (not self.is_async) or self.force_executor_for_async:
             if self.executor_backend == "thread":
                 self.fallback_exec = ThreadPoolExecutor(max_workers=max_concurrent_calls)
             elif self.executor_backend == "process":
@@ -146,14 +196,35 @@ class AsyncMMDataProcessor:
 
         async def _invoke() -> Dict[str, Any]:
             if self.is_async:
-                # Native async implementation
-                return await self._proc_async(
-                    image_data=image_data,
-                    audio_data=audio_data,
-                    input_text=input_text_or_ids,
-                    request_obj=request_obj,
-                    **kwargs,
-                )
+                if not self.force_executor_for_async:
+                    # Native async implementation
+                    return await self._proc_async(
+                        image_data=image_data,
+                        audio_data=audio_data,
+                        input_text=input_text_or_ids,
+                        request_obj=request_obj,
+                        **kwargs,
+                    )
+                loop = asyncio.get_running_loop()
+                if self.executor_backend == "process":
+                    fn = partial(
+                        _mp_process_mm_data_async_or_sync,
+                        image_data=image_data,
+                        audio_data=audio_data,
+                        input_text_or_ids=input_text_or_ids,
+                        request_obj=request_obj,
+                        kwargs=kwargs,
+                    )
+                else:
+                    call_kwargs = {
+                        "image_data": image_data,
+                        "audio_data": audio_data,
+                        "input_text": input_text_or_ids,
+                        "request_obj": request_obj,
+                        **kwargs,
+                    }
+                    fn = partial(_run_coroutine_in_new_loop, self._proc_async, call_kwargs)
+                return await loop.run_in_executor(self.fallback_exec, fn)
 
             # Synchronous fallback
             sync_fn = getattr(self.mm_processor, "process_mm_data", None)

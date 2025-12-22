@@ -75,6 +75,31 @@ class PicklableSyncProc:
         }
 
 
+class PicklableAsyncProc:
+    """A simple picklable async processor for executor-for-async tests."""
+
+    async def process_mm_data_async(
+        self,
+        *,
+        image_data=None,
+        audio_data=None,
+        input_text=None,
+        request_obj=None,
+        **kwargs,
+    ):
+        delay = kwargs.get("delay_s", 0.0)
+        if delay:
+            await asyncio.sleep(delay)
+        return {
+            "path": "async",
+            "images": image_data,
+            "audios": audio_data,
+            "text": input_text,
+            "request": request_obj,
+            "kwargs": kwargs,
+        }
+
+
 class TestAsyncMMDataProcessor:
     """Test suite for AsyncMMDataProcessor."""
 
@@ -200,6 +225,55 @@ class TestAsyncMMDataProcessor:
             assert out["text"] == [1, 2, 3]
             assert out["request"] == {"rid": 1}
             assert out["kwargs"]["role"] == "user"
+        finally:
+            proc.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_async_path_thread_executor_forced(self):
+        """Async path can be forced into a thread executor."""
+        proc = AsyncMMDataProcessor(
+            PicklableAsyncProc(),
+            executor_backend="thread",
+            force_executor_for_async=True,
+            max_concurrent_calls=2,
+        )
+        try:
+            out = await proc.process(
+                image_data=["img.png"],
+                input_text_or_ids="hello",
+                request_obj={"rid": 2},
+                mode="fast",
+            )
+            assert out["path"] == "async"
+            assert out["images"] == ["img.png"]
+            assert out["text"] == "hello"
+            assert out["request"] == {"rid": 2}
+            assert out["kwargs"]["mode"] == "fast"
+        finally:
+            proc.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_async_path_process_executor_forced(self):
+        """Async path can be forced into a process executor when picklable."""
+        proc = AsyncMMDataProcessor(
+            PicklableAsyncProc(),
+            executor_backend="process",
+            force_executor_for_async=True,
+            max_concurrent_calls=2,
+            mp_start_method="fork",
+        )
+        try:
+            out = await proc.process(
+                image_data=["img.png"],
+                input_text_or_ids="hello",
+                request_obj={"rid": 3},
+                mode="fast",
+            )
+            assert out["path"] == "async"
+            assert out["images"] == ["img.png"]
+            assert out["text"] == "hello"
+            assert out["request"] == {"rid": 3}
+            assert out["kwargs"]["mode"] == "fast"
         finally:
             proc.shutdown()
 
