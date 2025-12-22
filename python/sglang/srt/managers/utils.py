@@ -206,10 +206,12 @@ class TraceManager:
 trace_manager: Optional[TraceManager] = None
 
 
-def init_trace_manager(prefix: str, output_dir: str):
+def init_trace_manager(
+    prefix: str, output_dir: str, tp_rank: int = 0, pp_rank: int = 0
+):
     global trace_manager
     if trace_manager is None:
-        trace_manager = TraceManager(prefix, output_dir)
+        trace_manager = TraceManager(prefix, output_dir, tp_rank, pp_rank)
 
 
 def get_trace_manager() -> Optional[TraceManager]:
