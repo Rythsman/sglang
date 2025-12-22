@@ -161,13 +161,25 @@ def _identity(x: Any) -> Any:
     return x
 
 
+def _is_video_reader(obj: Any) -> bool:
+    """Check if obj looks like a decord.VideoReader."""
+    if obj is None:
+        return False
+    return callable(getattr(obj, "get_batch", None)) and callable(
+        getattr(obj, "get_avg_fps", None)
+    )
+
+
 def _load_and_resize_image_from_input(
     image_input: Union[str, bytes, Image.Image],
     image_cfg: Dict[str, Any],
     discard_alpha_channel: bool = True,
 ) -> Image.Image:
     """Load and resize an image in a worker process."""
-    image, _ = load_image(image_input)
+    if isinstance(image_input, Image.Image):
+        image = image_input
+    else:
+        image, _ = load_image(image_input)
     if discard_alpha_channel and isinstance(image, Image.Image) and image.mode != "RGB":
         image = image.convert("RGB")
     return resize_image(
@@ -253,6 +265,8 @@ def preprocess_video_sync(vr, ele: dict) -> Tuple[torch.Tensor, dict]:
 
 def _preprocess_video_from_input(video_input: Union[str, bytes], video_cfg: Dict[str, Any]):
     """Load and preprocess a video in a worker process."""
+    if _is_video_reader(video_input):
+        return preprocess_video_sync(video_input, video_cfg)
     vr = load_video(video_input)
     return preprocess_video_sync(vr, video_cfg)
 
@@ -628,9 +642,12 @@ class KeyeImageProcessor(SGLangBaseProcessor):
             for i, image in enumerate(base_output.images):
                 if isinstance(image, dict):
                     continue
+                exec_backend = self.cpu_executor
+                if isinstance(image, Image.Image):
+                    exec_backend = self.io_executor
                 tasks.append(
                     loop.run_in_executor(
-                        self.cpu_executor,
+                        exec_backend,
                         _load_and_resize_image_from_input,
                         image,
                         image_cfg,
@@ -646,22 +663,33 @@ class KeyeImageProcessor(SGLangBaseProcessor):
         if base_output.videos:
             video_cfg = getattr(request_obj, "video_processor_config", None) or {}
             loop = asyncio.get_running_loop()
-            processed = await asyncio.gather(
-                *[
+            tasks = []
+            task_indices = []
+            for i, video in enumerate(base_output.videos):
+                if isinstance(video, dict):
+                    continue
+                # VideoReader is not picklable. Avoid passing it to process pool.
+                exec_backend = self.cpu_executor
+                if _is_video_reader(video):
+                    exec_backend = self.io_executor
+                tasks.append(
                     loop.run_in_executor(
-                        self.cpu_executor, _preprocess_video_from_input, video, video_cfg
+                        exec_backend, _preprocess_video_from_input, video, video_cfg
                     )
-                    for video in base_output.videos
-                ]
-            )
-            frames_list, kwargs_list = zip(*processed) if processed else ([], [])
-            base_output.videos = list(frames_list)
+                )
+                task_indices.append(i)
+
             videos_kwargs = collections.defaultdict(list)
-            for kw in kwargs_list:
-                for k, v in kw.items():
-                    if v is None:
-                        continue
-                    videos_kwargs[k].append(v)
+            if tasks:
+                processed = await asyncio.gather(*tasks)
+                frames_list, kwargs_list = zip(*processed) if processed else ([], [])
+                for idx, frames in zip(task_indices, frames_list):
+                    base_output.videos[idx] = frames
+                for kw in kwargs_list:
+                    for k, v in kw.items():
+                        if v is None:
+                            continue
+                        videos_kwargs[k].append(v)
 
         preprocess_time = time.time()
 
