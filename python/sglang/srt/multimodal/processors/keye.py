@@ -19,7 +19,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
-from sglang.srt.utils import load_image, load_video
+from sglang.srt.utils import load_video
 from sglang.utils import logger
 
 # NOTE(wanghao44): same as preprocessor_config.json in keye-slowfast
@@ -161,35 +161,6 @@ def _identity(x: Any) -> Any:
     return x
 
 
-def _is_video_reader(obj: Any) -> bool:
-    """Check if obj looks like a decord.VideoReader."""
-    if obj is None:
-        return False
-    return callable(getattr(obj, "get_batch", None)) and callable(
-        getattr(obj, "get_avg_fps", None)
-    )
-
-
-def _load_and_resize_image_from_input(
-    image_input: Union[str, bytes, Image.Image],
-    image_cfg: Dict[str, Any],
-    discard_alpha_channel: bool = True,
-) -> Image.Image:
-    """Load and resize an image in a worker process."""
-    if isinstance(image_input, Image.Image):
-        image = image_input
-    else:
-        image, _ = load_image(image_input)
-    if discard_alpha_channel and isinstance(image, Image.Image) and image.mode != "RGB":
-        image = image.convert("RGB")
-    return resize_image(
-        image,
-        size_factor=int(image_cfg.get("factor", IMAGE_FACTOR)),
-        min_pixels=int(image_cfg.get("min_pixels", MIN_PIXELS)),
-        max_pixels=int(image_cfg.get("max_pixels", MAX_PIXELS)),
-    )
-
-
 def preprocess_video_sync(vr, ele: dict) -> Tuple[torch.Tensor, dict]:
     """Preprocess a decord VideoReader into frames and processor kwargs."""
     frames, timestamps, frame_types = _read_video_decord(vr, ele)
@@ -265,8 +236,6 @@ def preprocess_video_sync(vr, ele: dict) -> Tuple[torch.Tensor, dict]:
 
 def _preprocess_video_from_input(video_input: Union[str, bytes], video_cfg: Dict[str, Any]):
     """Load and preprocess a video in a worker process."""
-    if _is_video_reader(video_input):
-        return preprocess_video_sync(video_input, video_cfg)
     vr = load_video(video_input)
     return preprocess_video_sync(vr, video_cfg)
 
@@ -551,10 +520,10 @@ class KeyeImageProcessor(SGLangBaseProcessor):
         audio_sample_rate: Optional[int] = None,
     ) -> Tuple[List, List]:
         """
-        Keye-specific: keep image/video as raw inputs during `load_mm_data`.
+        Keye-specific: keep video as raw inputs during `load_mm_data`.
 
-        This enables running image/video preprocessing in multiprocessing later
-        without passing non-picklable objects (e.g., decord.VideoReader).
+        This enables doing video load+preprocess inside the process pool (cpu_executor)
+        without passing non-picklable objects (e.g., decord.VideoReader) across processes.
         """
         futures = []
         task_info = []
@@ -584,7 +553,7 @@ class KeyeImageProcessor(SGLangBaseProcessor):
                 except StopIteration:
                     raise ValueError("Mismatch between image tokens and estimated frame counts.")
 
-            if modality in (Modality.IMAGE, Modality.VIDEO):
+            if modality == Modality.VIDEO:
                 futures.append(self.io_executor.submit(_identity, data))
             else:
                 futures.append(
@@ -634,62 +603,49 @@ class KeyeImageProcessor(SGLangBaseProcessor):
 
         load_time = time.time()
 
-        if base_output.images:
+        # keye-specific: resize images if they are raw Image objects
+        if base_output.images and isinstance(base_output.images[0], Image.Image):
             image_cfg = getattr(request_obj, "image_processor_config", None) or {}
-            loop = asyncio.get_running_loop()
-            tasks = []
-            task_indices = []
-            for i, image in enumerate(base_output.images):
-                if isinstance(image, dict):
-                    continue
-                exec_backend = self.cpu_executor
-                if isinstance(image, Image.Image):
-                    exec_backend = self.io_executor
-                tasks.append(
-                    loop.run_in_executor(
-                        exec_backend,
-                        _load_and_resize_image_from_input,
-                        image,
-                        image_cfg,
-                        True,
-                    )
+            size_factor = image_cfg.get("factor", IMAGE_FACTOR)
+            min_pixels_cfg = image_cfg.get("min_pixels", MIN_PIXELS)
+            max_pixels_cfg = image_cfg.get("max_pixels", MAX_PIXELS)
+
+            resize_tasks = [
+                resize_image_async(
+                    image,
+                    size_factor=size_factor,
+                    min_pixels=min_pixels_cfg,
+                    max_pixels=max_pixels_cfg,
                 )
-                task_indices.append(i)
-            if tasks:
-                resized = await asyncio.gather(*tasks)
-                for idx, out in zip(task_indices, resized):
-                    base_output.images[idx] = out
+                for image in base_output.images
+            ]
+            base_output.images = await asyncio.gather(*resize_tasks)
 
         if base_output.videos:
             video_cfg = getattr(request_obj, "video_processor_config", None) or {}
             loop = asyncio.get_running_loop()
             tasks = []
             task_indices = []
+            videos_kwargs = collections.defaultdict(list)
             for i, video in enumerate(base_output.videos):
                 if isinstance(video, dict):
                     continue
-                # VideoReader is not picklable. Avoid passing it to process pool.
-                exec_backend = self.cpu_executor
-                if _is_video_reader(video):
-                    exec_backend = self.io_executor
                 tasks.append(
                     loop.run_in_executor(
-                        exec_backend, _preprocess_video_from_input, video, video_cfg
+                        self.cpu_executor, _preprocess_video_from_input, video, video_cfg
                     )
                 )
                 task_indices.append(i)
 
-            videos_kwargs = collections.defaultdict(list)
-            if tasks:
-                processed = await asyncio.gather(*tasks)
-                frames_list, kwargs_list = zip(*processed) if processed else ([], [])
-                for idx, frames in zip(task_indices, frames_list):
-                    base_output.videos[idx] = frames
-                for kw in kwargs_list:
-                    for k, v in kw.items():
-                        if v is None:
-                            continue
-                        videos_kwargs[k].append(v)
+            processed = await asyncio.gather(*tasks) if tasks else []
+            frames_list, kwargs_list = zip(*processed) if processed else ([], [])
+            for idx, frames in zip(task_indices, frames_list):
+                base_output.videos[idx] = frames
+            for kw in kwargs_list:
+                for k, v in kw.items():
+                    if v is None:
+                        continue
+                    videos_kwargs[k].append(v)
 
         preprocess_time = time.time()
 
