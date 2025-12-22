@@ -1,4 +1,3 @@
-import time
 from collections.abc import Iterable
 from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple, Type, Union
@@ -23,7 +22,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.io_struct import MultimodalRunTimeMetrics
+
+# from sglang.srt.managers.io_struct import MultimodalRunTimeMetrics
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -35,7 +35,6 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, print_info_once
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -814,13 +813,13 @@ class KeyeVLMoeForConditionalGeneration(nn.Module):
             )
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
-        if get_global_server_args().enable_metrics:
-            self.mm_runtime_metrics = MultimodalRunTimeMetrics()
-        else:
-            self.mm_runtime_metrics = None
+        # if get_global_server_args().enable_metrics:
+        #     self.mm_runtime_metrics = MultimodalRunTimeMetrics()
+        # else:
+        #     self.mm_runtime_metrics = None
 
-    def get_mm_run_time_metrics(self):
-        return self.mm_runtime_metrics
+    # def get_mm_run_time_metrics(self):
+    #     return self.mm_runtime_metrics
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -828,8 +827,8 @@ class KeyeVLMoeForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # TODO(wh): use decorator to refact
-        if self.mm_runtime_metrics is not None:
-            start_time = time.time()
+        # if self.mm_runtime_metrics is not None:
+        #     start_time = time.time()
 
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -877,16 +876,16 @@ class KeyeVLMoeForConditionalGeneration(nn.Module):
 
         image_embeds = torch.cat(self.mlp_AR(image_embeds, image_grid_thw), dim=0)
 
-        if self.mm_runtime_metrics is not None:
-            self.mm_runtime_metrics.log_image(
-                time.time() - start_time, image_embeds.shape[0]
-            )
+        # if self.mm_runtime_metrics is not None:
+        #     self.mm_runtime_metrics.log_image(
+        #         time.time() - start_time, image_embeds.shape[0]
+        #     )
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # TODO(wh): use decorator to refact
-        if self.mm_runtime_metrics is not None:
-            start_time = time.time()
+        # if self.mm_runtime_metrics is not None:
+        #     start_time = time.time()
 
         def split_thw(thw: torch.Tensor):
             if thw.dim() == 1:
@@ -939,10 +938,10 @@ class KeyeVLMoeForConditionalGeneration(nn.Module):
             window_size=-1,
         )
         video_embeds = torch.cat(self.mlp_AR(video_embeds, video_grid_thw), dim=0)
-        if self.mm_runtime_metrics is not None:
-            self.mm_runtime_metrics.log_video(
-                time.time() - start_time, video_embeds.shape[0]
-            )
+        # if self.mm_runtime_metrics is not None:
+        #     self.mm_runtime_metrics.log_video(
+        #         time.time() - start_time, video_embeds.shape[0]
+        #     )
 
         return video_embeds
 
@@ -980,8 +979,8 @@ class KeyeVLMoeForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-            if self.mm_runtime_metrics is not None:
-                self.mm_runtime_metrics.reset()
+            # if self.mm_runtime_metrics is not None:
+            #     self.mm_runtime_metrics.reset()
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,

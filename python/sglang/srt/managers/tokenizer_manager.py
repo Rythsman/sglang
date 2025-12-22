@@ -46,7 +46,7 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sglang.srt.managers.disagg_service import start_disagg_service
-from sglang.srt.managers.io_struct import (
+from sglang.srt.managers.io_struct import (  # MultimodalRunTimeMetrics,
     AbortReq,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
@@ -62,7 +62,6 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
-    MultimodalRunTimeMetrics,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
@@ -447,7 +446,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
-                (MultimodalRunTimeMetrics, self._handle_mm_run_time_metrics),
+                # (MultimodalRunTimeMetrics, self._handle_mm_run_time_metrics),
             ]
         )
         self.init_communicators(server_args)
@@ -2348,14 +2347,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         return scores
 
-    def _handle_mm_run_time_metrics(self, recv_obj):
-        if recv_obj.image_run_times:
-            self.image_run_times.extend(recv_obj.image_run_times)
-            self.image_tokens.extend(recv_obj.image_tokens)
+    # def _handle_mm_run_time_metrics(self, recv_obj):
+    #     if recv_obj.image_run_times:
+    #         self.image_run_times.extend(recv_obj.image_run_times)
+    #         self.image_tokens.extend(recv_obj.image_tokens)
 
-        if recv_obj.video_run_times:
-            self.video_run_times.extend(recv_obj.video_run_times)
-            self.video_tokens.extend(recv_obj.video_tokens)
+    #     if recv_obj.video_run_times:
+    #         self.video_run_times.extend(recv_obj.video_run_times)
+    #         self.video_tokens.extend(recv_obj.video_tokens)
 
     async def score_request(
         self,
