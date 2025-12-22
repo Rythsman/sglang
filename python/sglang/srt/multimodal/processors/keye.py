@@ -4,7 +4,7 @@ import math
 import os
 import re
 import time
-from typing import Dict, List, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -12,12 +12,14 @@ import torch
 from einops import rearrange
 from PIL import Image
 
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.keye_deepseek import KeyeVLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.utils import load_video
 from sglang.utils import logger
 
 # NOTE(wanghao44): same as preprocessor_config.json in keye-slowfast
@@ -152,6 +154,90 @@ async def resize_image_async(
         min_pixels=min_pixels,
         max_pixels=max_pixels,
     )
+
+
+def _identity(x: Any) -> Any:
+    """Return the input as-is."""
+    return x
+
+
+def preprocess_video_sync(vr, ele: dict) -> Tuple[torch.Tensor, dict]:
+    """Preprocess a decord VideoReader into frames and processor kwargs."""
+    frames, timestamps, frame_types = _read_video_decord(vr, ele)
+    img_factor = ele.get("factor", IMAGE_FACTOR)
+    nframes = len(frame_types)
+    fast_nframes = int(sum(frame_types))
+    slow_nframes = nframes - fast_nframes
+
+    min_pixels = max(int(ele.get("min_pixels", VIDEO_MIN_PIXELS)), VIDEO_MIN_PIXELS)
+    min_tokens = int(min_pixels / img_factor / img_factor)
+    left = min_pixels / img_factor / img_factor
+    right = ele.get("max_pixels", VIDEO_MAX_PIXELS) / img_factor / img_factor
+
+    def _estimate_total_pixels(tokens_per_frame):
+        return (
+            slow_nframes * tokens_per_frame * img_factor * img_factor
+            + fast_nframes
+            * max(int(FAST_TOKEN_RATIO * tokens_per_frame), min_tokens)
+            * img_factor
+            * img_factor
+        )
+
+    while left < right:
+        mid = int(left + right) // 2
+        if _estimate_total_pixels(mid) > ele.get(
+            "video_total_pixels", VIDEO_TOTAL_PIXELS
+        ):
+            right = mid
+        else:
+            left = mid + 1
+    slow_max_pixels = left * img_factor * img_factor
+
+    _, _, height, width = frames.shape
+
+    resized_height, resized_width = smart_resize(
+        height,
+        width,
+        factor=img_factor,
+        min_pixels=min_pixels,
+        max_pixels=slow_max_pixels,
+    )
+    slow_num_tokens = resized_height * resized_width / img_factor / img_factor
+    fast_max_pixels = max(
+        int(slow_num_tokens * FAST_TOKEN_RATIO) * img_factor * img_factor,
+        VIDEO_MIN_PIXELS,
+    )
+
+    fast_resized_height, fast_resized_width = smart_resize(
+        height,
+        width,
+        factor=img_factor,
+        min_pixels=min_pixels,
+        max_pixels=fast_max_pixels,
+    )
+    fast_num_tokens = fast_resized_height * fast_resized_width / img_factor / img_factor
+    logger.debug(
+        f"fetch_video: {nframes=}, {slow_nframes=}, {fast_nframes=}, {slow_num_tokens=}, "
+        f"{fast_num_tokens=}, {min_pixels=}, {resized_height=}, {resized_width=}, "
+        f"{fast_resized_height=}, {fast_resized_width}"
+    )
+    processor_kwargs = {
+        "height": resized_height,
+        "width": resized_width,
+        "fast_height": fast_resized_height,
+        "fast_width": fast_resized_width,
+    }
+    if timestamps is not None:
+        processor_kwargs["timestamps"] = timestamps
+    if frame_types is not None:
+        processor_kwargs["frame_types"] = frame_types
+    return frames, processor_kwargs
+
+
+def _preprocess_video_from_input(video_input: Union[str, bytes], video_cfg: Dict[str, Any]):
+    """Load and preprocess a video in a worker process."""
+    vr = load_video(video_input)
+    return preprocess_video_sync(vr, video_cfg)
 
 
 def smart_nframes(ele: dict, total_frames: int, video_fps: int | float) -> int:
@@ -388,75 +474,7 @@ def _read_video_decord(
 
 
 async def preprocess_video(vr, ele: dict) -> Tuple[torch.Tensor, dict]:
-    frames, timestamps, frame_types = _read_video_decord(vr, ele)
-    img_factor = ele.get("factor", IMAGE_FACTOR)
-    nframes = len(frame_types)
-    fast_nframes = int(sum(frame_types))
-    slow_nframes = nframes - fast_nframes
-
-    min_pixels = max(int(ele.get("min_pixels", VIDEO_MIN_PIXELS)), VIDEO_MIN_PIXELS)
-    min_tokens = int(min_pixels / img_factor / img_factor)
-    left = min_pixels / img_factor / img_factor
-    right = ele.get("max_pixels", VIDEO_MAX_PIXELS) / img_factor / img_factor
-
-    def _estimate_total_pixels(tokens_per_frame):
-        return (
-            slow_nframes * tokens_per_frame * img_factor * img_factor
-            + fast_nframes
-            * max(int(FAST_TOKEN_RATIO * tokens_per_frame), min_tokens)
-            * img_factor
-            * img_factor
-        )
-
-    while left < right:
-        mid = int(left + right) // 2
-        if _estimate_total_pixels(mid) > ele.get(
-            "video_total_pixels", VIDEO_TOTAL_PIXELS
-        ):
-            right = mid
-        else:
-            left = mid + 1
-    slow_max_pixels = left * img_factor * img_factor
-
-    _, _, height, width = frames.shape
-
-    resized_height, resized_width = smart_resize(
-        height,
-        width,
-        factor=img_factor,
-        min_pixels=min_pixels,
-        max_pixels=slow_max_pixels,
-    )
-    slow_num_tokens = resized_height * resized_width / img_factor / img_factor
-    fast_max_pixels = max(
-        int(slow_num_tokens * FAST_TOKEN_RATIO) * img_factor * img_factor,
-        VIDEO_MIN_PIXELS,
-    )
-
-    fast_resized_height, fast_resized_width = smart_resize(
-        height,
-        width,
-        factor=img_factor,
-        min_pixels=min_pixels,
-        max_pixels=fast_max_pixels,
-    )
-    fast_num_tokens = fast_resized_height * fast_resized_width / img_factor / img_factor
-    logger.debug(
-        f"fetch_video: {nframes=}, {slow_nframes=}, {fast_nframes=}, {slow_num_tokens=}, "
-        f"{fast_num_tokens=}, {min_pixels=}, {resized_height=}, {resized_width=}, "
-        f"{fast_resized_height=}, {fast_resized_width}"
-    )
-    processor_kwargs = {
-        "height": resized_height,
-        "width": resized_width,
-        "fast_height": fast_resized_height,
-        "fast_width": fast_resized_width,
-    }
-    if timestamps is not None:
-        processor_kwargs["timestamps"] = timestamps
-    if frame_types is not None:
-        processor_kwargs["frame_types"] = frame_types
-    return frames, processor_kwargs
+    return preprocess_video_sync(vr, ele)
 
 
 class KeyeImageProcessor(SGLangBaseProcessor):
@@ -489,6 +507,80 @@ class KeyeImageProcessor(SGLangBaseProcessor):
             video_token_id=hf_config.video_token_id,
             audio_token_id=self.audio_token_id,
         ).build(_processor)
+
+    def submit_data_loading_tasks(
+        self,
+        text_parts: List[str],
+        multimodal_tokens: MultimodalSpecialTokens,
+        data_iterators: dict[Modality, Iterator[Any]],
+        discard_alpha_channel: bool = True,
+        image_estimated_frames_iter: Optional[iter] = None,
+        image_scaling_factor: float = 1.0,
+        max_image_frames: int = 30,
+        audio_sample_rate: Optional[int] = None,
+    ) -> Tuple[List, List]:
+        """
+        Keye-specific: keep video as raw inputs during `load_mm_data`.
+
+        This enables doing video load+preprocess inside the process pool (cpu_executor)
+        without passing non-picklable objects (e.g., decord.VideoReader) across processes.
+        """
+        futures = []
+        task_info = []
+
+        for text_part in text_parts:
+            modality = multimodal_tokens.get_modality_of_token(text_part)
+            if modality is None:
+                continue
+
+            data_iterator = data_iterators.get(modality)
+            if data_iterator is None:
+                raise ValueError(f"No data iterator found for token: {text_part}")
+
+            try:
+                data = next(data_iterator)
+            except StopIteration:
+                raise ValueError(
+                    f"Mismatch: More '{text_part}' tokens found than corresponding data items provided."
+                )
+
+            frame_count_limit = None
+            if modality == Modality.IMAGE and image_estimated_frames_iter:
+                try:
+                    estimated_frames = next(image_estimated_frames_iter)
+                    frame_count_limit = max(1, int(estimated_frames * image_scaling_factor))
+                    _ = max_image_frames  # Keep the same signature semantics.
+                except StopIteration:
+                    raise ValueError("Mismatch between image tokens and estimated frame counts.")
+
+            if modality == Modality.VIDEO:
+                futures.append(self.io_executor.submit(_identity, data))
+            else:
+                futures.append(
+                    self.io_executor.submit(
+                        SGLangBaseProcessor._load_single_item,
+                        data,
+                        modality,
+                        frame_count_limit,
+                        audio_sample_rate,
+                        discard_alpha_channel,
+                    )
+                )
+
+            task_info.append((modality, data, frame_count_limit))
+
+        for modality, iterator in data_iterators.items():
+            try:
+                next(iterator)
+                logger.warning(
+                    f"Warning: More {modality.name.lower()} data items provided than corresponding tokens found in the prompt."
+                )
+            except StopIteration:
+                pass
+            except Exception:
+                pass
+
+        return futures, task_info
 
     async def process_mm_data_async(
         self,
@@ -531,12 +623,24 @@ class KeyeImageProcessor(SGLangBaseProcessor):
 
         if base_output.videos:
             video_cfg = getattr(request_obj, "video_processor_config", None) or {}
-            processed = [
-                await preprocess_video(video, video_cfg) for video in base_output.videos
-            ]
-            frames_list, kwargs_list = zip(*processed) if processed else ([], [])
-            base_output.videos = list(frames_list)
+            loop = asyncio.get_running_loop()
+            tasks = []
+            task_indices = []
             videos_kwargs = collections.defaultdict(list)
+            for i, video in enumerate(base_output.videos):
+                if isinstance(video, dict):
+                    continue
+                tasks.append(
+                    loop.run_in_executor(
+                        self.cpu_executor, _preprocess_video_from_input, video, video_cfg
+                    )
+                )
+                task_indices.append(i)
+
+            processed = await asyncio.gather(*tasks) if tasks else []
+            frames_list, kwargs_list = zip(*processed) if processed else ([], [])
+            for idx, frames in zip(task_indices, frames_list):
+                base_output.videos[idx] = frames
             for kw in kwargs_list:
                 for k, v in kw.items():
                     if v is None:
