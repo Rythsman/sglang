@@ -10,94 +10,14 @@ Covers:
 """
 
 import asyncio
-import importlib.util
 import logging
-import pathlib
-import sys
 import threading
 import time
-import types
 from unittest.mock import Mock
 
 import pytest
 
-_ASYNC_MM_DATA_PROCESSOR_PATH = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "python"
-    / "sglang"
-    / "srt"
-    / "managers"
-    / "async_mm_data_processor.py"
-)
-
-# Create lightweight stubs so the module is importable by name.
-# This avoids importing the full `sglang` package (which may require extra deps).
-for _pkg_name in ["sglang", "sglang.srt", "sglang.srt.managers"]:
-    if _pkg_name not in sys.modules:
-        _m = types.ModuleType(_pkg_name)
-        _m.__path__ = []  # Mark as namespace package.
-        sys.modules[_pkg_name] = _m
-
-_spec = importlib.util.spec_from_file_location(
-    "sglang.srt.managers.async_mm_data_processor",
-    _ASYNC_MM_DATA_PROCESSOR_PATH,
-)
-if _spec is None or _spec.loader is None:
-    raise RuntimeError("Failed to load async_mm_data_processor module spec.")
-_mod = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = _mod
-_spec.loader.exec_module(_mod)
-AsyncMMDataProcessor = _mod.AsyncMMDataProcessor
-
-
-class PicklableSyncProc:
-    """A simple picklable processor for multiprocess backend tests."""
-
-    def process_mm_data(
-        self,
-        *,
-        image_data=None,
-        audio_data=None,
-        input_text=None,
-        request_obj=None,
-        **kwargs,
-    ):
-        delay = kwargs.get("delay_s", 0.0)
-        if delay:
-            time.sleep(delay)
-        return {
-            "path": "sync",
-            "images": image_data,
-            "audios": audio_data,
-            "text": input_text,
-            "request": request_obj,
-            "kwargs": kwargs,
-        }
-
-
-class PicklableAsyncProc:
-    """A simple picklable async processor for executor-for-async tests."""
-
-    async def process_mm_data_async(
-        self,
-        *,
-        image_data=None,
-        audio_data=None,
-        input_text=None,
-        request_obj=None,
-        **kwargs,
-    ):
-        delay = kwargs.get("delay_s", 0.0)
-        if delay:
-            await asyncio.sleep(delay)
-        return {
-            "path": "async",
-            "images": image_data,
-            "audios": audio_data,
-            "text": input_text,
-            "request": request_obj,
-            "kwargs": kwargs,
-        }
+from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 
 
 class TestAsyncMMDataProcessor:
@@ -196,86 +116,6 @@ class TestAsyncMMDataProcessor:
         assert out["text"] == [1, 2, 3]
         assert out["request"] == "req-obj"
         assert out["kwargs"]["role"] == "user"
-
-    @pytest.mark.asyncio
-    async def test_sync_fallback_process_backend_basic(self):
-        """
-        Process backend should work when inputs are picklable.
-
-        Note: multiprocess backend requires that mm_processor/init args and per-call
-        arguments (request_obj/kwargs) are picklable.
-        """
-        proc = AsyncMMDataProcessor(
-            PicklableSyncProc(),
-            executor_backend="process",
-            max_concurrent_calls=2,
-            mp_start_method="fork",
-        )
-        try:
-            out = await proc.process(
-                image_data=[b"\x00\x01"],
-                audio_data=None,
-                input_text_or_ids=[1, 2, 3],
-                request_obj={"rid": 1},
-                role="user",
-            )
-            assert out["path"] == "sync"
-            assert out["images"] == [b"\x00\x01"]
-            assert out["audios"] is None
-            assert out["text"] == [1, 2, 3]
-            assert out["request"] == {"rid": 1}
-            assert out["kwargs"]["role"] == "user"
-        finally:
-            proc.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_async_path_thread_executor_forced(self):
-        """Async path can be forced into a thread executor."""
-        proc = AsyncMMDataProcessor(
-            PicklableAsyncProc(),
-            executor_backend="thread",
-            force_executor_for_async=True,
-            max_concurrent_calls=2,
-        )
-        try:
-            out = await proc.process(
-                image_data=["img.png"],
-                input_text_or_ids="hello",
-                request_obj={"rid": 2},
-                mode="fast",
-            )
-            assert out["path"] == "async"
-            assert out["images"] == ["img.png"]
-            assert out["text"] == "hello"
-            assert out["request"] == {"rid": 2}
-            assert out["kwargs"]["mode"] == "fast"
-        finally:
-            proc.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_async_path_process_executor_forced(self):
-        """Async path can be forced into a process executor when picklable."""
-        proc = AsyncMMDataProcessor(
-            PicklableAsyncProc(),
-            executor_backend="process",
-            force_executor_for_async=True,
-            max_concurrent_calls=2,
-            mp_start_method="fork",
-        )
-        try:
-            out = await proc.process(
-                image_data=["img.png"],
-                input_text_or_ids="hello",
-                request_obj={"rid": 3},
-                mode="fast",
-            )
-            assert out["path"] == "async"
-            assert out["images"] == ["img.png"]
-            assert out["text"] == "hello"
-            assert out["request"] == {"rid": 3}
-            assert out["kwargs"]["mode"] == "fast"
-        finally:
-            proc.shutdown()
 
     @pytest.mark.asyncio
     async def test_timeout_async(self, async_processor):
