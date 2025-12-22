@@ -79,7 +79,13 @@ from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
-from sglang.srt.managers.utils import extract_mm_info, trace_req
+from sglang.srt.managers.utils import (
+    ReqTraceStatus,
+    extract_mm_info,
+    get_trace_manager,
+    trace_req_begin,
+    trace_req_end,
+)
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -541,6 +547,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
 
             if obj.is_single:
+                trace_req_begin(obj.rid, ReqTraceStatus.PRE_SCHEDULER, created_time)
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
@@ -724,7 +731,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 input_text, is_cross_encoder_request
             )
 
+        trace_req_end(obj.rid, ReqTraceStatus.PRE_SCHEDULER)
         if self.mm_processor and obj.contains_mm_input():
+            trace_req_begin(obj.rid, ReqTraceStatus.MM_PROCESS)
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
@@ -738,6 +747,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+            trace_req_end(
+                obj.rid,
+                ReqTraceStatus.MM_PROCESS,
+                extra_info=extract_mm_info(mm_inputs),
+            )
+
         else:
             mm_inputs = None
 
@@ -978,6 +993,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 )
             )
             trace_slice_end(RequestStage.TOKENIZE, req.rid)
+            trace_req_end(req.rid, ReqTraceStatus.PRE_SCHEDULER)
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -1033,6 +1049,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
     ):
+        trace_req_begin(obj.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
@@ -1062,6 +1079,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
+        if get_trace_manager() is not None:
+            for tokenized_obj in tokenized_objs:
+                trace_req_begin(tokenized_obj.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+
         self.send_to_scheduler.send_pyobj(batch_req)
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
@@ -1069,8 +1090,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             state = ReqState(
                 [], False, asyncio.Event(), tmp_obj, created_time=created_time
             )
-            if tmp_obj.contains_mm_input():
-                state.mm_info = extract_mm_info(tokenized_obj)
             self.rid_to_state[tmp_obj.rid] = state
 
     async def _wait_one_response(
@@ -1101,7 +1120,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             state.out_list = []
             if state.finished:
-                trace_req(obj.rid, state, out)
+                trace_req_end(obj.rid, ReqTraceStatus.POST_SCHEDULER)
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_ts` has not been set yet).
                 # Record response sent time right before we log finished results and metrics.
                 if not state.response_sent_to_client_ts:
@@ -1203,6 +1222,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
+                    trace_req_begin(
+                        tmp_obj.rid, ReqTraceStatus.PRE_SCHEDULER, created_time
+                    )
                     generators.append(
                         self._wait_one_response(
                             tmp_obj, self.rid_to_state[tmp_obj.rid], request
@@ -1218,6 +1240,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
+                        trace_req_begin(
+                            tmp_obj.rid, ReqTraceStatus.PRE_SCHEDULER, created_time
+                        )
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
                         state = self._send_one_request(
                             tmp_obj, tokenized_obj, created_time
@@ -1249,6 +1274,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
+                trace_req_begin(
+                    tokenized_obj.rid, ReqTraceStatus.PRE_SCHEDULER, created_time
+                )
+                trace_req_end(tokenized_obj.rid, ReqTraceStatus.PRE_SCHEDULER)
                 state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 await self._wait_one_response(tmp_obj, state, request).__anext__()
 
@@ -1258,6 +1287,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    trace_req_begin(
+                        tokenized_obj.rid, ReqTraceStatus.PRE_SCHEDULER, created_time
+                    )
+                    trace_req_end(tokenized_obj.rid, ReqTraceStatus.PRE_SCHEDULER)
                     state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)

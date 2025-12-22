@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.managers.utils import ReqTraceStatus, trace_req_begin, trace_req_end
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
@@ -66,6 +67,9 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        for req in batch.reqs:
+            trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_PREFILL)
+
         skip_stream_req = None
 
         if self.is_generation:
@@ -316,6 +320,9 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        for req in batch.reqs:
+            trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_DECODE)
+
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
@@ -795,6 +802,7 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if req.finished():
+                trace_req_begin(req.rid, ReqTraceStatus.POST_SCHEDULER)
                 if req.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice
                     # because of the one additional delayed token. This "continue" prevented the dummy output.

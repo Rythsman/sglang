@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import math
+import os
 import re
 import time
 from typing import Dict, List, Tuple, Union
@@ -31,9 +32,13 @@ IMAGE_FACTOR = 28  # PATCH_SIZE * MERGE_SIZE
 # min tokens per image
 MIN_TOKENS = 4
 # max tokens per image
-MAX_TOKENS = 20480
-MIN_PIXELS = MIN_TOKENS * IMAGE_FACTOR * IMAGE_FACTOR  # 4 * 28 * 28 = 3,136
-MAX_PIXELS = MAX_TOKENS * IMAGE_FACTOR * IMAGE_FACTOR  # 20480 * 28 * 28 = 16,056,320
+# MAX_TOKENS = 20480
+MAX_TOKENS = int(os.environ.get("IMAGE_MAX_TOKENS", 4096))
+print(f"{MAX_TOKENS=}", flush=True)
+MIN_PIXELS = 102400  # MIN_TOKENS * IMAGE_FACTOR * IMAGE_FACTOR  # 4 * 28 * 28 = 3,136
+MAX_PIXELS = (
+    3211264  # MAX_TOKENS * IMAGE_FACTOR * IMAGE_FACTOR  # 20480 * 28 * 28 = 16,056,320
+)
 MAX_RATIO = 200
 
 # min tokens per video frame
@@ -44,14 +49,19 @@ VIDEO_MAX_TOKENS = 768
 VIDEO_MIN_PIXELS = (
     VIDEO_MIN_TOKENS * IMAGE_FACTOR * IMAGE_FACTOR
 )  # 32 * 28 * 28 = 25,088
-# max pixels per video frame
+
+# min tokens per video frame
 VIDEO_MAX_PIXELS = (
     VIDEO_MAX_TOKENS * IMAGE_FACTOR * IMAGE_FACTOR
 )  # 768 * 28 * 28 = 602,112
+VIDEO_TOTAL_MAX_TOKENS = int(os.environ.get("VIDEO_TOTAL_MAX_TOKENS", 4096))
 # max total pixels per video
 VIDEO_TOTAL_PIXELS = (
-    65536 * IMAGE_FACTOR * IMAGE_FACTOR
+    VIDEO_TOTAL_MAX_TOKENS * IMAGE_FACTOR * IMAGE_FACTOR
 )  # 65,536 * 28 * 28 = 51,380,224
+
+VIDEO_TOTAL_PIXELS = 6422528
+
 # default fps
 FPS = 2.0
 

@@ -71,7 +71,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.managers.utils import dump_tracing_events, init_tracing_manager
+from sglang.srt.managers.utils import dump_trace_events, init_trace_manager
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
@@ -333,7 +333,7 @@ class TokenizerCommunicatorMixin:
         if activities and "CUSTOM_PROFILER" in activities:
             if output_dir is None:
                 output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
-            init_tracing_manager("tm_", output_dir)
+            init_trace_manager("tm_", output_dir)
 
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
         with_stack = False if with_stack is False or env_with_stack is False else True
@@ -367,7 +367,7 @@ class TokenizerCommunicatorMixin:
         if not result.success:
             raise RuntimeError(result.message)
         if req.type == ProfileReqType.STOP_PROFILE:
-            dump_tracing_events()
+            dump_trace_events()
         return result
 
     async def start_expert_distribution_record(self: TokenizerManager):

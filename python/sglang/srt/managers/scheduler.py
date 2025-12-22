@@ -152,7 +152,10 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
-    trace_profile,
+    ReqTraceStatus,
+    get_trace_manager,
+    trace_req_begin,
+    trace_req_end,
     validate_input_length,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -1105,6 +1108,14 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+
+                if get_trace_manager() is not None:
+                    for req in recv_reqs:
+                        if isinstance(
+                            req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        ):
+                            trace_req_end(req.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+
             else:
                 recv_reqs = None
         else:
@@ -1506,6 +1517,7 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
+            trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1969,12 +1981,21 @@ class Scheduler(
     ):
         pass
 
-    @trace_profile("run_batch")
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+
+        for req in batch.reqs:
+            trace_req_begin(
+                req.rid,
+                (
+                    ReqTraceStatus.SCHEDULER_DECODE
+                    if batch.forward_mode.is_decode()
+                    else ReqTraceStatus.SCHEDULER_PREFILL
+                ),
+            )
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)

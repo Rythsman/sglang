@@ -19,7 +19,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.managers.utils import TracingProfiler
+from sglang.srt.managers.utils import (
+    BatchTraceStatus,
+    trace_batch_begin,
+    trace_batch_end,
+)
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -696,20 +700,19 @@ def general_mm_embed_routine(
                     for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                     if forward_batch.mm_inputs[i] is not None
                 ]
-                with TracingProfiler(
-                    "embed_mm_inputs(vit)", forward_batch=forward_batch
-                ):
-                    input_embeds, other_info = embed_mm_inputs(
-                        mm_inputs_list=mm_inputs_list,
-                        extend_prefix_lens=extend_prefix_lens,
-                        extend_seq_lens=extend_seq_lens,
-                        input_ids=input_ids,
-                        multimodal_model=multimodal_model,
-                        input_embedding=embed_tokens,
-                        data_embedding_func_mapping=data_embedding_funcs,
-                        placeholder_tokens=placeholder_tokens,
-                        use_deepstack=use_deepstack,
-                    )
+                trace_batch_begin(BatchTraceStatus.ENCODER, tid=1)
+                input_embeds, other_info = embed_mm_inputs(
+                    mm_inputs_list=mm_inputs_list,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    input_ids=input_ids,
+                    multimodal_model=multimodal_model,
+                    input_embedding=embed_tokens,
+                    data_embedding_func_mapping=data_embedding_funcs,
+                    placeholder_tokens=placeholder_tokens,
+                    use_deepstack=use_deepstack,
+                )
+                trace_batch_end(BatchTraceStatus.ENCODER, tid=1)
                 # add for qwen3_vl deepstack
                 if use_deepstack:
                     kwargs["input_deepstack_embeds"] = other_info[
@@ -727,13 +730,14 @@ def general_mm_embed_routine(
         else:
             input_embeds = None
 
-    with TracingProfiler("language_model_forward", forward_batch=forward_batch):
-        hidden_states = language_model(
-            input_ids=None,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-            **kwargs,
-        )
+    trace_batch_begin(BatchTraceStatus.PREFILL, tid=1)
+    hidden_states = language_model(
+        input_ids=None,
+        forward_batch=forward_batch,
+        input_embeds=input_embeds,
+        **kwargs,
+    )
+    trace_batch_end(BatchTraceStatus.PREFILL, tid=1)
     return hidden_states
 
 
