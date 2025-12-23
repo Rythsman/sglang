@@ -2825,6 +2825,7 @@ class ModelRunner:
                 "batch_size": forward_batch.batch_size,
                 "extend_num_tokens": forward_batch.extend_num_tokens,
             },
+            tid="ModelRunner::forward",
         )
 
         with get_global_expert_distribution_recorder().with_forward_pass(
@@ -2842,7 +2843,7 @@ class ModelRunner:
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
 
-        trace_batch_end(forward_batch.forward_mode)
+        trace_batch_end(forward_batch.forward_mode, tid="ModelRunner::forward")
         return output
 
     def _forward_raw(

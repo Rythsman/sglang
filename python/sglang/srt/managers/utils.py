@@ -227,12 +227,13 @@ def dump_trace_events():
 
 class ReqTraceStatus(IntEnum):
     PRE_SCHEDULER = auto()
+    MM_PROCESS = auto()
     PRE_SCHEDULER_COMM = auto()
+    SCHEDULER_BROADCAST = auto()
     SCHEDULER_WAITING = auto()
     SCHEDULER_PREFILL = auto()
     SCHEDULER_DECODE = auto()
     POST_SCHEDULER = auto()
-    MM_PROCESS = auto()
 
 
 def trace_req_begin(
@@ -255,7 +256,7 @@ def trace_req_begin(
             "name": status.name,
             "ts": (time_s or time.time()) * 1000000.0,
             "ph": "B",
-            "pid": 0,
+            "pid": "ReqDetail",
             "tid": rid,
             "args": extra_info,
         }
@@ -282,7 +283,7 @@ def trace_req_end(
             "name": status.name,
             "ts": (time_s or time.time()) * 1000000.0,
             "ph": "E",
-            "pid": 0,
+            "pid": "ReqDetail",
             "tid": rid,
             "args": extra_info,
         }
@@ -298,7 +299,7 @@ class BatchTraceStatus(IntEnum):
 def trace_batch_begin(
     status: Union[ForwardMode, BatchTraceStatus],
     extra_info: Dict[Any, Any] = {},
-    tid: int = 0,
+    tid: str = "Default",
 ):
     global trace_manager
     if trace_manager is None:
@@ -320,7 +321,7 @@ def trace_batch_begin(
 def trace_batch_end(
     status: Union[ForwardMode, BatchTraceStatus],
     extra_info: Dict[Any, Any] = {},
-    tid: int = 0,
+    tid: str = "Default",
 ):
     global trace_manager
     if trace_manager is None:
@@ -339,7 +340,7 @@ def trace_batch_end(
     )
 
 
-def trace_usage(name: str, args: Dict[Any, Any], tid: int = 2):
+def trace_usage(name: str, args: Dict[Any, Any], tid: str = "Usage"):
     global trace_manager
     if trace_manager is None:
         return
@@ -351,7 +352,7 @@ def trace_usage(name: str, args: Dict[Any, Any], tid: int = 2):
             "ts": time.time() * 1000000.0,
             "ph": "C",
             "pid": trace_manager.pid,
-            "tid": 1,
+            "tid": tid,
             "args": args,
         }
     )

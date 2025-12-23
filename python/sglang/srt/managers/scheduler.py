@@ -1115,6 +1115,7 @@ class Scheduler(
                             req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
                         ):
                             trace_req_end(req.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+                            trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
 
             else:
                 recv_reqs = None
@@ -1517,7 +1518,12 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
-            trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
+            if is_retracted:
+                trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_DECODE)
+                trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
+            else:
+                trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
+                trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1861,6 +1867,9 @@ class Scheduler(
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
                 req.add_latency(RequestStage.PREFILL_WAITING)
+                if req in self.waiting_queue:
+                    trace_req_end(req.rid, ReqTraceStatus.SCHEDULER_WAITING)
+                    trace_req_begin(req.rid, ReqTraceStatus.SCHEDULER_PREFILL)
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -1986,16 +1995,6 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
-
-        for req in batch.reqs:
-            trace_req_begin(
-                req.rid,
-                (
-                    ReqTraceStatus.SCHEDULER_DECODE
-                    if batch.forward_mode.is_decode()
-                    else ReqTraceStatus.SCHEDULER_PREFILL
-                ),
-            )
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
