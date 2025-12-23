@@ -1481,6 +1481,11 @@ class Scheduler(
         """Handle optimized batch generate request."""
         logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
 
+        if get_trace_manager() is not None:
+            for tokenized_req in recv_req:
+                trace_req_end(tokenized_req.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+                trace_req_begin(tokenized_req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
+
         # Process each request in the batch
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
@@ -1661,6 +1666,11 @@ class Scheduler(
         logger.debug(
             f"Processing batch embedding request with {len(recv_req)} requests"
         )
+
+        if get_trace_manager() is not None:
+            for tokenized_req in recv_req:
+                trace_req_end(tokenized_req.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+                trace_req_begin(tokenized_req.rid, ReqTraceStatus.SCHEDULER_BROADCAST)
 
         # Process each request in the batch
         for tokenized_req in recv_req:

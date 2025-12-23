@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+try:
+    import pynvml  # type: ignore
+except Exception:  # pragma: no cover
+    pynvml = None
+
 
 @dataclasses.dataclass
 class GenerationBatchResult:
@@ -182,11 +187,38 @@ class TraceManager:
         file_name = f"{prefix}custom_profiler.trace.json.gz"
         self.output_path = os.path.join(output_dir, file_name)
         self.events = []
-        self.pid = psutil.Process().name()
+        self.pid = os.getpid()
+        self.process_name = psutil.Process().name()
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
 
         logger.info(f"Tracing events will be dumped to {self.output_path}")
+        self._append_metadata()
+
+    def _append_metadata(self):
+        """Append Chrome trace metadata events.
+
+        NOTE: Chrome trace metadata expects numeric pid/tid. We keep tid as string
+        in other events for readability, but use tid=0 in metadata.
+        """
+        self.append(
+            {
+                "ph": "M",
+                "name": "process_name",
+                "pid": self.pid,
+                "tid": 0,
+                "args": {"name": self.process_name},
+            }
+        )
+        self.append(
+            {
+                "ph": "M",
+                "name": "process_labels",
+                "pid": self.pid,
+                "tid": 0,
+                "args": {"tp_rank": self.tp_rank, "pp_rank": self.pp_rank},
+            }
+        )
 
     def dump_events(self):
         logger.info(f"Dumpping events to {self.output_path}")
@@ -207,10 +239,28 @@ trace_manager: Optional[TraceManager] = None
 
 
 def init_trace_manager(
-    prefix: str, output_dir: str, tp_rank: int = 0, pp_rank: int = 0
+    prefix: str,
+    output_dir: str,
+    tp_rank: int = 0,
+    pp_rank: int = 0,
+    force: bool = False,
 ):
     global trace_manager
-    if trace_manager is None:
+    if trace_manager is None or force:
+        trace_manager = TraceManager(prefix, output_dir, tp_rank, pp_rank)
+        return
+
+    # Re-init if output file or ranks changed. This avoids silently writing new
+    # profile data into an old trace file (common when /start_profile is called
+    # multiple times within the same process lifetime).
+    new_output_path = os.path.join(output_dir, f"{prefix}custom_profiler.trace.json.gz")
+    if (
+        trace_manager.output_path != new_output_path
+        or trace_manager.tp_rank != tp_rank
+        or trace_manager.pp_rank != pp_rank
+    ):
+        if trace_manager.events:
+            trace_manager.dump_events()
         trace_manager = TraceManager(prefix, output_dir, tp_rank, pp_rank)
 
 
@@ -240,7 +290,7 @@ def trace_req_begin(
     rid: int,
     status: ReqTraceStatus,
     time_s: Optional[float] = None,
-    extra_info: Dict[Any, Any] = {},
+    extra_info: Optional[Dict[Any, Any]] = None,
 ):
     global trace_manager
     if (
@@ -256,9 +306,9 @@ def trace_req_begin(
             "name": status.name,
             "ts": (time_s or time.time()) * 1000000.0,
             "ph": "B",
-            "pid": "ReqDetail",
+            "pid": trace_manager.pid,
             "tid": rid,
-            "args": extra_info,
+            "args": extra_info or {},
         }
     )
 
@@ -267,7 +317,7 @@ def trace_req_end(
     rid: int,
     status: ReqTraceStatus,
     time_s: Optional[float] = None,
-    extra_info: Dict[Any, Any] = {},
+    extra_info: Optional[Dict[Any, Any]] = None,
 ):
     global trace_manager
     if (
@@ -283,9 +333,9 @@ def trace_req_end(
             "name": status.name,
             "ts": (time_s or time.time()) * 1000000.0,
             "ph": "E",
-            "pid": "ReqDetail",
+            "pid": trace_manager.pid,
             "tid": rid,
-            "args": extra_info,
+            "args": extra_info or {},
         }
     )
 
@@ -298,7 +348,7 @@ class BatchTraceStatus(IntEnum):
 
 def trace_batch_begin(
     status: Union[ForwardMode, BatchTraceStatus],
-    extra_info: Dict[Any, Any] = {},
+    extra_info: Optional[Dict[Any, Any]] = None,
     tid: str = "Default",
 ):
     global trace_manager
@@ -313,14 +363,14 @@ def trace_batch_begin(
             "ph": "B",
             "pid": trace_manager.pid,
             "tid": tid,
-            "args": extra_info,
+            "args": extra_info or {},
         }
     )
 
 
 def trace_batch_end(
     status: Union[ForwardMode, BatchTraceStatus],
-    extra_info: Dict[Any, Any] = {},
+    extra_info: Optional[Dict[Any, Any]] = None,
     tid: str = "Default",
 ):
     global trace_manager
@@ -335,7 +385,7 @@ def trace_batch_end(
             "ph": "E",
             "pid": trace_manager.pid,
             "tid": tid,
-            "args": extra_info,
+            "args": extra_info or {},
         }
     )
 
@@ -358,6 +408,75 @@ def trace_usage(name: str, args: Dict[Any, Any], tid: str = "Usage"):
     )
 
 
+_nvml_inited = False
+_nvml_handles: Dict[int, Any] = {}
+
+
+def _ensure_nvml_inited() -> bool:
+    global _nvml_inited
+    if pynvml is None:
+        return False
+    if _nvml_inited:
+        return True
+    try:
+        pynvml.nvmlInit()
+    except Exception:
+        return False
+    _nvml_inited = True
+    return True
+
+
+def _get_nvml_handle(device_index: int):
+    if device_index in _nvml_handles:
+        return _nvml_handles[device_index]
+    handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+    _nvml_handles[device_index] = handle
+    return handle
+
+
+def trace_nvml_memory(
+    tid: Optional[str] = None,
+    device_index: Optional[int] = None,
+    name: str = "NVML Memory",
+):
+    """Trace NVML used/free/total memory as Chrome counter events.
+
+    This is only active when the custom trace manager is initialized (i.e., CUSTOM_PROFILER),
+    and will no-op if NVML is unavailable.
+    """
+    global trace_manager
+    if trace_manager is None:
+        return
+    if not torch.cuda.is_available():
+        return
+    if not _ensure_nvml_inited():
+        return
+
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    try:
+        handle = _get_nvml_handle(device_index)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    except Exception:
+        return
+
+    if tid is None:
+        tid = f"NVML TP{trace_manager.tp_rank} PP{trace_manager.pp_rank}"
+
+    trace_usage(
+        name,
+        {
+            "device_index": int(device_index),
+            "used_bytes": int(mem.used),
+            "free_bytes": int(mem.free),
+            "total_bytes": int(mem.total),
+            "tp_rank": int(trace_manager.tp_rank),
+            "pp_rank": int(trace_manager.pp_rank),
+        },
+        tid=tid,
+    )
+
+
 def extract_mm_info(
     mm_inputs: Dict[str, Any],
 ):
@@ -374,7 +493,7 @@ def extract_mm_info(
     if "mm_total_time" in mm_inputs:
         result["mm_total_time(ms)"] = mm_inputs["mm_total_time"] * 1000.0
 
-    for item in mm_inputs["mm_items"]:
+    for item in mm_inputs.get("mm_items", []):
         result[item.modality.name] = {"offsets": item.offsets}
 
     return result
