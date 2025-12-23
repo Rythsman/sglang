@@ -260,10 +260,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.mm_processor = get_mm_processor(
                 self.model_config.hf_config, server_args, _processor, transport_mode
             )
+            timeout_s = (
+                self.server_args.mm_per_request_timeout
+                if self.server_args.mm_per_request_timeout > 0
+                else None
+            )
             self.mm_data_processor = AsyncMMDataProcessor(
                 self.mm_processor,
                 max_concurrent_calls=self.server_args.mm_max_concurrent_calls,
-                timeout_s=self.server_args.mm_per_request_timeout,
+                timeout_s=timeout_s,
             )
 
             if server_args.skip_tokenizer_init:
