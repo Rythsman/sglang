@@ -637,7 +637,17 @@ class KeyeImageProcessor(SGLangBaseProcessor):
                 )
                 task_indices.append(i)
 
-            processed = await asyncio.gather(*tasks) if tasks else []
+            processed = []
+            if tasks:
+                try:
+                    processed = await asyncio.gather(*tasks)
+                except asyncio.CancelledError:
+                    # Best-effort cleanup: cancel local futures to avoid leaving pending tasks.
+                    # Note: executor work may still continue in background processes.
+                    for t in tasks:
+                        t.cancel()
+                    await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+                    raise
             frames_list, kwargs_list = zip(*processed) if processed else ([], [])
             for idx, frames in zip(task_indices, frames_list):
                 base_output.videos[idx] = frames
