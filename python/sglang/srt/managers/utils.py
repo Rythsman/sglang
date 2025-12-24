@@ -5,6 +5,7 @@ import gzip
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from enum import IntEnum, auto
@@ -196,8 +197,13 @@ class TraceManager:
         # file_name = f"{prefix}custom_profiler.chrome_trace.json"
         file_name = f"{prefix}custom_profiler.trace.json.gz"
         self.output_path = os.path.join(output_dir, file_name)
-        self.events = []
-        self._events_lock = threading.Lock()
+        # Multiple producer threads may append events (e.g. main thread + NVML sampler).
+        # Use a thread-safe queue to avoid per-event locking on the hot path.
+        self._events_q: queue.SimpleQueue[object] = queue.SimpleQueue()
+        # A buffer for events that failed to be written in a previous dump attempt.
+        # Protected by _dump_lock; append() never touches it.
+        self._pending_events: List[dict] = []
+        self._dump_lock = threading.Lock()
         self.pid = os.getpid()
         self.process_name = psutil.Process().name()
         self.tp_rank = tp_rank
@@ -341,9 +347,21 @@ class TraceManager:
         never crash the serving loop (e.g. user moved/deleted the output dir).
         """
         logger.info(f"Dumpping events to {self.output_path}")
-        with self._events_lock:
-            events = self.events
-            self.events = []
+        with self._dump_lock:
+            sentinel = _TraceEventQueueSentinel(token=time.time_ns())
+            # Mark the snapshot boundary. All events appended before this put()
+            # will appear before the sentinel and be drained in this dump.
+            self._events_q.put(sentinel)
+            drained: List[dict] = []
+            while True:
+                item = self._events_q.get()
+                if item is sentinel:
+                    break
+                # Only dicts are expected as events.
+                if isinstance(item, dict):
+                    drained.append(item)
+            events = self._pending_events + drained
+            self._pending_events = []
 
         parent_dir = os.path.dirname(self.output_path)
         if parent_dir:
@@ -386,9 +404,8 @@ class TraceManager:
                         "Profiling output is skipped for stability.",
                         exc_info=True,
                     )
-                    with self._events_lock:
-                        # Put events back so a later dump may succeed.
-                        self.events = events + self.events
+                    with self._dump_lock:
+                        self._pending_events = events + self._pending_events
                     return
             else:
                 logger.warning(
@@ -396,23 +413,29 @@ class TraceManager:
                     "Profiling output is skipped for stability.",
                     exc_info=True,
                 )
-                with self._events_lock:
-                    self.events = events + self.events
+                with self._dump_lock:
+                    self._pending_events = events + self._pending_events
                 return
         except Exception:
             logger.warning(
                 "Failed to dump profiling events. Profiling output is skipped for stability.",
                 exc_info=True,
             )
-            with self._events_lock:
-                self.events = events + self.events
+            with self._dump_lock:
+                self._pending_events = events + self._pending_events
             return
 
         logger.info(f"Dump events({len(events)}) finished")
 
     def append(self, event: dict):
-        with self._events_lock:
-            self.events.append(event)
+        self._events_q.put(event)
+
+
+@dataclasses.dataclass(frozen=True)
+class _TraceEventQueueSentinel:
+    """A unique marker object used to delimit a dump snapshot."""
+
+    token: int
 
 
 trace_manager: Optional[TraceManager] = None
@@ -427,41 +450,32 @@ def init_trace_manager(
     enable_nvml_sampler: Optional[bool] = None,
 ):
     global trace_manager
-    if enable_nvml_sampler is None and trace_manager is not None:
-        enable_nvml_sampler = trace_manager.enable_nvml_sampler
     if enable_nvml_sampler is None:
-        enable_nvml_sampler = True
-    if trace_manager is None or force:
-        if trace_manager is not None:
-            trace_manager.stop_nvml_sampler()
-        trace_manager = TraceManager(
-            prefix,
-            output_dir,
-            tp_rank,
-            pp_rank,
-            enable_nvml_sampler=enable_nvml_sampler,
+        enable_nvml_sampler = (
+            trace_manager.enable_nvml_sampler if trace_manager is not None else True
         )
-        return
 
-    # Re-init if output file or ranks changed. This avoids silently writing new
-    # profile data into an old trace file (common when /start_profile is called
-    # multiple times within the same process lifetime).
     new_output_path = os.path.join(output_dir, f"{prefix}custom_profiler.trace.json.gz")
-    if (
-        trace_manager.output_path != new_output_path
+    needs_reinit = (
+        force
+        or trace_manager is None
+        or trace_manager.output_path != new_output_path
         or trace_manager.tp_rank != tp_rank
         or trace_manager.pp_rank != pp_rank
-    ):
-        if trace_manager.events:
-            trace_manager.dump_events()
+    )
+    if not needs_reinit:
+        return
+
+    if trace_manager is not None:
         trace_manager.stop_nvml_sampler()
-        trace_manager = TraceManager(
-            prefix,
-            output_dir,
-            tp_rank,
-            pp_rank,
-            enable_nvml_sampler=enable_nvml_sampler,
-        )
+        trace_manager.dump_events()
+    trace_manager = TraceManager(
+        prefix,
+        output_dir,
+        tp_rank,
+        pp_rank,
+        enable_nvml_sampler=enable_nvml_sampler,
+    )
 
 
 def get_trace_manager() -> Optional[TraceManager]:
