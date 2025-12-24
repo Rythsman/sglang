@@ -330,10 +330,11 @@ class TokenizerCommunicatorMixin:
         profile_stages: Optional[List[str]] = None,
     ):
         self.auto_create_handle_loop()
+        profile_id = str(time.time())
         if activities and "CUSTOM_PROFILER" in activities:
             if output_dir is None:
                 output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
-            init_trace_manager("tm_", output_dir)
+            init_trace_manager(f"tm_{profile_id}-", output_dir, force=True)
 
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
         with_stack = False if with_stack is False or env_with_stack is False else True
@@ -350,7 +351,7 @@ class TokenizerCommunicatorMixin:
             with_stack=with_stack,
             record_shapes=record_shapes,
             profile_by_stage=profile_by_stage,
-            profile_id=str(time.time()),
+            profile_id=profile_id,
             merge_profiles=merge_profiles,
             profile_prefix=profile_prefix,
             profile_stages=profile_stages,
