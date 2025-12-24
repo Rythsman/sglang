@@ -198,10 +198,12 @@ class TraceManager:
         nvml_file_name = f"{prefix}custom_profiler.nvml.trace.json.gz"
         self.output_path = os.path.join(output_dir, main_file_name)
         self.nvml_output_path = os.path.join(output_dir, nvml_file_name)
-        # Main trace events. Protected by a lock to avoid races between append()
-        # and dump_events(). This keeps the implementation simple and robust.
+        # Main trace events.
+        #
+        # NOTE: The serving stack assumes stop_profile() is only called after all
+        # in-flight requests have finished and no more trace events will be appended.
+        # With that contract, we can keep a simple list without locking.
         self.events: List[dict] = []
-        self._events_lock = threading.Lock()
         # NVML events are produced by a single background thread. We only read and dump them
         # after joining that thread, so no additional locking is needed.
         self._nvml_events: List[dict] = []
@@ -363,9 +365,8 @@ class TraceManager:
         never crash the serving loop (e.g. user moved/deleted the output dir).
         """
         logger.info(f"Dumpping events to {self.output_path}")
-        with self._events_lock:
-            events = self.events
-            self.events = []
+        events = self.events
+        self.events = []
 
         self._dump_events_to_path(events=events, output_path=self.output_path)
         logger.info(f"Dump events({len(events)}) finished")
@@ -387,8 +388,7 @@ class TraceManager:
         logger.info(f"Dump NVML events({len(self._nvml_events)}) finished")
 
     def append(self, event: dict):
-        with self._events_lock:
-            self.events.append(event)
+        self.events.append(event)
 
     def _dump_events_to_path(self, events: List[dict], output_path: str) -> None:
         parent_dir = os.path.dirname(output_path)
@@ -433,8 +433,7 @@ class TraceManager:
                         exc_info=True,
                     )
                     if output_path == self.output_path:
-                        with self._events_lock:
-                            self.events = events + self.events
+                        self.events = events + self.events
                     return
             else:
                 logger.warning(
@@ -443,8 +442,7 @@ class TraceManager:
                     exc_info=True,
                 )
                 if output_path == self.output_path:
-                    with self._events_lock:
-                        self.events = events + self.events
+                    self.events = events + self.events
                 return
         except Exception:
             logger.warning(
@@ -452,8 +450,7 @@ class TraceManager:
                 exc_info=True,
             )
             if output_path == self.output_path:
-                with self._events_lock:
-                    self.events = events + self.events
+                self.events = events + self.events
             return
 
 
@@ -486,9 +483,12 @@ def init_trace_manager(
         return
 
     if trace_manager is not None:
-        trace_manager.stop_nvml_sampler()
-        trace_manager.dump_events()
-        trace_manager.dump_nvml_events()
+        old = trace_manager
+        # Prevent any late trace appends during dumping/re-init.
+        trace_manager = None
+        old.stop_nvml_sampler()
+        old.dump_events()
+        old.dump_nvml_events()
     trace_manager = TraceManager(
         prefix,
         output_dir,
@@ -506,9 +506,12 @@ def get_trace_manager() -> Optional[TraceManager]:
 def dump_trace_events():
     global trace_manager
     if trace_manager is not None:
-        trace_manager.stop_nvml_sampler()
-        trace_manager.dump_events()
-        trace_manager.dump_nvml_events()
+        tm = trace_manager
+        # Prevent any late trace appends during dumping.
+        trace_manager = None
+        tm.stop_nvml_sampler()
+        tm.dump_events()
+        tm.dump_nvml_events()
 
 
 class ReqTraceStatus(IntEnum):
