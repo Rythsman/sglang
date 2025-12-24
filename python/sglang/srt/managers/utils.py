@@ -306,7 +306,9 @@ def trace_req_begin(
             "name": status.name,
             "ts": (time_s or time.time()) * 1000000.0,
             "ph": "B",
-            "pid": trace_manager.pid,
+            # Keep request-level events in a dedicated pseudo-process to avoid
+            # leaking request details into the scheduler/model runner timelines.
+            "pid": "ReqDetail",
             "tid": rid,
             "args": extra_info or {},
         }
@@ -333,7 +335,9 @@ def trace_req_end(
             "name": status.name,
             "ts": (time_s or time.time()) * 1000000.0,
             "ph": "E",
-            "pid": trace_manager.pid,
+            # Keep request-level events in a dedicated pseudo-process to avoid
+            # leaking request details into the scheduler/model runner timelines.
+            "pid": "ReqDetail",
             "tid": rid,
             "args": extra_info or {},
         }
