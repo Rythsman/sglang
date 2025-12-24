@@ -336,16 +336,80 @@ class TraceManager:
         )
 
     def dump_events(self):
+        """Dump collected Chrome trace events to disk (best-effort).
+
+        This is used by the scheduler process. Profiling output failures should
+        never crash the serving loop (e.g. user moved/deleted the output dir).
+        """
         logger.info(f"Dumpping events to {self.output_path}")
         with self._events_lock:
             events = self.events
             self.events = []
-        if self.output_path.endswith(".gz"):
-            with gzip.open(self.output_path, "wt") as f:
-                f.write(json.dumps(events, indent=4, separators=(",", ":")))
-        else:
-            with open(self.output_path, "w") as f:
-                f.write(json.dumps(events, indent=4, separators=(",", ":")))
+
+        parent_dir = os.path.dirname(self.output_path)
+        if parent_dir:
+            # Ensure output directory exists. This makes repeated profiling
+            # robust even if the user moves/deletes the profile directory.
+            os.makedirs(parent_dir, exist_ok=True)
+
+        payload = json.dumps(events, indent=4, separators=(",", ":"))
+
+        def _write_atomically() -> None:
+            # Atomic replace avoids partial/corrupted files if the process exits
+            # or errors out mid-write.
+            tmp_path = f"{self.output_path}.tmp.{os.getpid()}.{time.time_ns()}"
+            try:
+                if self.output_path.endswith(".gz"):
+                    with gzip.open(tmp_path, "wt") as f:
+                        f.write(payload)
+                else:
+                    with open(tmp_path, "w") as f:
+                        f.write(payload)
+                os.replace(tmp_path, self.output_path)
+            finally:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    # Best-effort cleanup.
+                    pass
+
+        try:
+            _write_atomically()
+        except FileNotFoundError:
+            # The directory may have been moved/deleted between makedirs and open.
+            if parent_dir:
+                try:
+                    os.makedirs(parent_dir, exist_ok=True)
+                    _write_atomically()
+                except Exception:
+                    logger.warning(
+                        "Failed to dump profiling events (directory missing). "
+                        "Profiling output is skipped for stability.",
+                        exc_info=True,
+                    )
+                    with self._events_lock:
+                        # Put events back so a later dump may succeed.
+                        self.events = events + self.events
+                    return
+            else:
+                logger.warning(
+                    "Failed to dump profiling events (invalid output path). "
+                    "Profiling output is skipped for stability.",
+                    exc_info=True,
+                )
+                with self._events_lock:
+                    self.events = events + self.events
+                return
+        except Exception:
+            logger.warning(
+                "Failed to dump profiling events. Profiling output is skipped for stability.",
+                exc_info=True,
+            )
+            with self._events_lock:
+                self.events = events + self.events
+            return
+
         logger.info(f"Dump events({len(events)}) finished")
 
     def append(self, event: dict):
