@@ -30,6 +30,8 @@ try:
 except Exception:  # pragma: no cover
     pynvml = None
 
+_BYTES_TO_GIB = 1.0 / (1024.0 * 1024.0 * 1024.0)
+
 
 @dataclasses.dataclass
 class GenerationBatchResult:
@@ -256,7 +258,10 @@ class TraceManager:
             return
         if not _ensure_nvml_inited():
             return
-        if self._nvml_sampler_thread is not None and self._nvml_sampler_thread.is_alive():
+        if (
+            self._nvml_sampler_thread is not None
+            and self._nvml_sampler_thread.is_alive()
+        ):
             return
 
         stop = threading.Event()
@@ -315,11 +320,9 @@ class TraceManager:
                 "tid": tid,
                 "args": {
                     "device_index": int(device_index),
-                    "used_bytes": int(mem.used),
-                    "free_bytes": int(mem.free),
-                    "total_bytes": int(mem.total),
-                    "tp_rank": int(self.tp_rank),
-                    "pp_rank": int(self.pp_rank),
+                    "used_bytes": mem.used * _BYTES_TO_GIB,
+                    "free_bytes": mem.free * _BYTES_TO_GIB,
+                    "total_bytes": mem.total * _BYTES_TO_GIB,
                 },
             }
         )
@@ -547,49 +550,6 @@ def _get_nvml_handle(device_index: int):
     handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
     _nvml_handles[device_index] = handle
     return handle
-
-
-def trace_nvml_memory(
-    tid: Optional[str] = None,
-    device_index: Optional[int] = None,
-    name: str = "NVML Memory",
-):
-    """Trace NVML used/free/total memory as Chrome counter events.
-
-    This is only active when the custom trace manager is initialized (i.e., CUSTOM_PROFILER),
-    and will no-op if NVML is unavailable.
-    """
-    global trace_manager
-    if trace_manager is None:
-        return
-    if not torch.cuda.is_available():
-        return
-    if not _ensure_nvml_inited():
-        return
-
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    try:
-        handle = _get_nvml_handle(device_index)
-        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    except Exception:
-        return
-
-    if tid is None:
-        tid = f"NVML TP{trace_manager.tp_rank} PP{trace_manager.pp_rank}"
-
-    trace_usage(
-        name,
-        {
-            "device_index": int(device_index),
-            "used_bytes": int(mem.used),
-            "free_bytes": int(mem.free),
-            "total_bytes": int(mem.total),
-            "tp_rank": int(trace_manager.tp_rank),
-            "pp_rank": int(trace_manager.pp_rank),
-        },
-        tid=tid,
-    )
 
 
 def extract_mm_info(
