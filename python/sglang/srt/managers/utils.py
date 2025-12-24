@@ -5,6 +5,7 @@ import gzip
 import json
 import logging
 import os
+import threading
 import time
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -187,13 +188,17 @@ class TraceManager:
         file_name = f"{prefix}custom_profiler.trace.json.gz"
         self.output_path = os.path.join(output_dir, file_name)
         self.events = []
+        self._events_lock = threading.Lock()
         self.pid = os.getpid()
         self.process_name = psutil.Process().name()
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
+        self._nvml_sampler_stop: Optional[threading.Event] = None
+        self._nvml_sampler_thread: Optional[threading.Thread] = None
 
         logger.info(f"Tracing events will be dumped to {self.output_path}")
         self._append_metadata()
+        self._maybe_start_nvml_sampler()
 
     def _append_metadata(self):
         """Append Chrome trace metadata events.
@@ -220,19 +225,121 @@ class TraceManager:
             }
         )
 
+    @staticmethod
+    def _get_nvml_sampling_interval_s() -> float:
+        """Return NVML sampling interval in seconds.
+
+        Set env var SGLANG_NVML_SAMPLING_INTERVAL_MS:
+        - <= 0: disable sampling
+        - > 0: sampling interval in milliseconds
+        """
+        raw = os.getenv("SGLANG_NVML_SAMPLING_INTERVAL_MS", "500").strip()
+        try:
+            interval_ms = float(raw)
+        except ValueError:
+            interval_ms = 500.0
+        return interval_ms / 1000.0
+
+    def _maybe_start_nvml_sampler(self):
+        """Start a low-frequency NVML sampler in a background thread.
+
+        The sampler is only enabled when:
+        - custom trace manager is initialized
+        - torch.cuda is available
+        - NVML is available
+        - SGLANG_NVML_SAMPLING_INTERVAL_MS > 0
+        """
+        interval_s = self._get_nvml_sampling_interval_s()
+        if interval_s <= 0:
+            return
+        if not torch.cuda.is_available():
+            return
+        if not _ensure_nvml_inited():
+            return
+        if self._nvml_sampler_thread is not None and self._nvml_sampler_thread.is_alive():
+            return
+
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=self._nvml_sampler_loop,
+            args=(stop, interval_s),
+            daemon=True,
+            name=f"sglang-nvml-sampler-tp{self.tp_rank}-pp{self.pp_rank}",
+        )
+        self._nvml_sampler_stop = stop
+        self._nvml_sampler_thread = thread
+        thread.start()
+
+    def stop_nvml_sampler(self):
+        """Stop the NVML sampler thread (best-effort)."""
+        stop = self._nvml_sampler_stop
+        thread = self._nvml_sampler_thread
+        self._nvml_sampler_stop = None
+        self._nvml_sampler_thread = None
+        if stop is None or thread is None:
+            return
+        stop.set()
+        thread.join(timeout=1.0)
+
+    def _nvml_sampler_loop(self, stop: threading.Event, interval_s: float):
+        tid = f"NVML TP{self.tp_rank} PP{self.pp_rank}"
+        while not stop.is_set():
+            self._trace_nvml_memory_counter(tid=tid)
+            stop.wait(interval_s)
+
+    def _trace_nvml_memory_counter(self, tid: str, device_index: Optional[int] = None):
+        """Append NVML used/free/total memory as Chrome counter events."""
+        if not torch.cuda.is_available():
+            return
+        if not _ensure_nvml_inited():
+            return
+
+        if device_index is None:
+            try:
+                device_index = torch.cuda.current_device()
+            except Exception:
+                return
+        try:
+            handle = _get_nvml_handle(device_index)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        except Exception:
+            return
+
+        self.append(
+            {
+                "cat": "NVML Memory",
+                "name": "NVML Memory",
+                "ts": time.time() * 1000000.0,
+                "ph": "C",
+                "pid": self.pid,
+                "tid": tid,
+                "args": {
+                    "device_index": int(device_index),
+                    "used_bytes": int(mem.used),
+                    "free_bytes": int(mem.free),
+                    "total_bytes": int(mem.total),
+                    "tp_rank": int(self.tp_rank),
+                    "pp_rank": int(self.pp_rank),
+                },
+            }
+        )
+
     def dump_events(self):
         logger.info(f"Dumpping events to {self.output_path}")
+        with self._events_lock:
+            events = self.events
+            self.events = []
         if self.output_path.endswith(".gz"):
             with gzip.open(self.output_path, "wt") as f:
-                f.write(json.dumps(self.events, indent=4, separators=(",", ":")))
+                f.write(json.dumps(events, indent=4, separators=(",", ":")))
         else:
             with open(self.output_path, "w") as f:
-                f.write(json.dumps(self.events, indent=4, separators=(",", ":")))
-        logger.info(f"Dump events({len(self.events)}) finished")
-        self.events = []
+                f.write(json.dumps(events, indent=4, separators=(",", ":")))
+        logger.info(f"Dump events({len(events)}) finished")
 
     def append(self, event: dict):
-        self.events.append(event)
+        with self._events_lock:
+            self.events.append(event)
 
 
 trace_manager: Optional[TraceManager] = None
@@ -247,6 +354,8 @@ def init_trace_manager(
 ):
     global trace_manager
     if trace_manager is None or force:
+        if trace_manager is not None:
+            trace_manager.stop_nvml_sampler()
         trace_manager = TraceManager(prefix, output_dir, tp_rank, pp_rank)
         return
 
@@ -261,6 +370,7 @@ def init_trace_manager(
     ):
         if trace_manager.events:
             trace_manager.dump_events()
+        trace_manager.stop_nvml_sampler()
         trace_manager = TraceManager(prefix, output_dir, tp_rank, pp_rank)
 
 
@@ -272,6 +382,7 @@ def get_trace_manager() -> Optional[TraceManager]:
 def dump_trace_events():
     global trace_manager
     if trace_manager is not None:
+        trace_manager.stop_nvml_sampler()
         trace_manager.dump_events()
 
 
