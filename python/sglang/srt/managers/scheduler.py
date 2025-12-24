@@ -2497,7 +2497,7 @@ class Scheduler(
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
-                    self._add_request_to_queue(req)
+                    self._add_request_to_queue(req, is_retracted=True)
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None

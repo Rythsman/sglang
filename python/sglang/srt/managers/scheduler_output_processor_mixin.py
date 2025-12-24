@@ -108,7 +108,10 @@ class SchedulerOutputProcessorMixin:
                     continue
 
                 if req.is_chunked <= 0:
-                    if len(req.output_ids) == 0:
+                    is_decode_req = (
+                        batch.decoding_reqs is not None and req in batch.decoding_reqs
+                    )
+                    if not is_decode_req:
                         trace_req_end(
                             req.rid,
                             ReqTraceStatus.SCHEDULER_PREFILL,

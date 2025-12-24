@@ -501,11 +501,12 @@ def trace_req_begin(
     ):
         return
 
+    ts_s = time.time() if time_s is None else time_s
     trace_manager.append(
         {
             "cat": f"req_{rid}",
             "name": status.name,
-            "ts": (time_s or time.time()) * 1000000.0,
+            "ts": ts_s * 1000000.0,
             "ph": "B",
             # Keep request-level events in a dedicated pseudo-process to avoid
             # leaking request details into the scheduler/model runner timelines.
@@ -530,11 +531,12 @@ def trace_req_end(
     ):
         return
 
+    ts_s = time.time() if time_s is None else time_s
     trace_manager.append(
         {
             "cat": f"req_{rid}",
             "name": status.name,
-            "ts": (time_s or time.time()) * 1000000.0,
+            "ts": ts_s * 1000000.0,
             "ph": "E",
             # Keep request-level events in a dedicated pseudo-process to avoid
             # leaking request details into the scheduler/model runner timelines.
