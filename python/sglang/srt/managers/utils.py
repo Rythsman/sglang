@@ -195,8 +195,10 @@ class TraceManager:
         enable_nvml_sampler: bool = True,
     ):
         # file_name = f"{prefix}custom_profiler.chrome_trace.json"
-        file_name = f"{prefix}custom_profiler.trace.json.gz"
-        self.output_path = os.path.join(output_dir, file_name)
+        main_file_name = f"{prefix}custom_profiler.trace.json.gz"
+        nvml_file_name = f"{prefix}custom_profiler.nvml.trace.json.gz"
+        self.output_path = os.path.join(output_dir, main_file_name)
+        self.nvml_output_path = os.path.join(output_dir, nvml_file_name)
         # Multiple producer threads may append events (e.g. main thread + NVML sampler).
         # Use a thread-safe queue to avoid per-event locking on the hot path.
         self._events_q: queue.SimpleQueue[object] = queue.SimpleQueue()
@@ -204,6 +206,9 @@ class TraceManager:
         # Protected by _dump_lock; append() never touches it.
         self._pending_events: List[dict] = []
         self._dump_lock = threading.Lock()
+        # NVML events are produced by a single background thread. We only read and dump them
+        # after joining that thread, so no additional locking is needed.
+        self._nvml_events: List[dict] = []
         self.pid = os.getpid()
         self.process_name = psutil.Process().name()
         self.tp_rank = tp_rank
@@ -213,34 +218,40 @@ class TraceManager:
         self._nvml_sampler_thread: Optional[threading.Thread] = None
 
         logger.info(f"Tracing events will be dumped to {self.output_path}")
-        self._append_metadata()
+        self._append_metadata_to_main()
         if self.enable_nvml_sampler:
             self._maybe_start_nvml_sampler()
 
-    def _append_metadata(self):
-        """Append Chrome trace metadata events.
+    def _metadata_events(self) -> List[dict]:
+        """Build Chrome trace metadata events.
 
         NOTE: Chrome trace metadata expects numeric pid/tid. We keep tid as string
         in other events for readability, but use tid=0 in metadata.
         """
-        self.append(
+        return [
             {
                 "ph": "M",
                 "name": "process_name",
                 "pid": self.pid,
                 "tid": 0,
                 "args": {"name": self.process_name},
-            }
-        )
-        self.append(
+            },
             {
                 "ph": "M",
                 "name": "process_labels",
                 "pid": self.pid,
                 "tid": 0,
                 "args": {"tp_rank": self.tp_rank, "pp_rank": self.pp_rank},
-            }
-        )
+            },
+        ]
+
+    def _append_metadata_to_main(self) -> None:
+        for e in self._metadata_events():
+            self.append(e)
+
+    def _append_metadata_to_nvml(self) -> None:
+        for e in self._metadata_events():
+            self.append_nvml(e)
 
     @staticmethod
     def _get_nvml_sampling_interval_s() -> float:
@@ -279,6 +290,8 @@ class TraceManager:
         ):
             return
 
+        # Write metadata once the sampler is confirmed to start.
+        self._append_metadata_to_nvml()
         stop = threading.Event()
         thread = threading.Thread(
             target=self._nvml_sampler_loop,
@@ -293,18 +306,25 @@ class TraceManager:
     def stop_nvml_sampler(self):
         stop = self._nvml_sampler_stop
         thread = self._nvml_sampler_thread
-        self._nvml_sampler_stop = None
-        self._nvml_sampler_thread = None
         if stop is None or thread is None:
             return
         stop.set()
         thread.join(timeout=1.0)
+        if thread.is_alive():
+            # Keep handles so callers can retry stop later. Avoid dumping NVML events
+            # while the sampler is still running.
+            return
+        self._nvml_sampler_stop = None
+        self._nvml_sampler_thread = None
 
     def _nvml_sampler_loop(self, stop: threading.Event, interval_s: float):
         tid = f"NVML TP{self.tp_rank} PP{self.pp_rank}"
         while not stop.is_set():
             self._trace_nvml_memory_counter(tid=tid)
             stop.wait(interval_s)
+
+    def append_nvml(self, event: dict) -> None:
+        self._nvml_events.append(event)
 
     def _trace_nvml_memory_counter(self, tid: str, device_index: Optional[int] = None):
         """Append NVML used/free/total memory as Chrome counter events."""
@@ -324,7 +344,7 @@ class TraceManager:
         except Exception:
             return
 
-        self.append(
+        self.append_nvml(
             {
                 "cat": "NVML Memory",
                 "name": "NVML Memory",
@@ -341,7 +361,7 @@ class TraceManager:
         )
 
     def dump_events(self):
-        """Dump collected Chrome trace events to disk.
+        """Dump collected (non-NVML) Chrome trace events to disk.
 
         This is used by the scheduler process. Profiling output failures should
         never crash the serving loop (e.g. user moved/deleted the output dir).
@@ -363,7 +383,30 @@ class TraceManager:
             events = self._pending_events + drained
             self._pending_events = []
 
-        parent_dir = os.path.dirname(self.output_path)
+        self._dump_events_to_path(events=events, output_path=self.output_path)
+        logger.info(f"Dump events({len(events)}) finished")
+
+    def dump_nvml_events(self) -> None:
+        """Dump collected NVML Chrome trace events to disk.
+
+        NVML events are only appended by the sampler thread. Call stop_nvml_sampler()
+        before dumping to avoid races.
+        """
+        if not self.enable_nvml_sampler:
+            return
+        if self._nvml_sampler_thread is not None and self._nvml_sampler_thread.is_alive():
+            return
+        if not self._nvml_events:
+            return
+        logger.info(f"Dumpping NVML events to {self.nvml_output_path}")
+        self._dump_events_to_path(events=self._nvml_events, output_path=self.nvml_output_path)
+        logger.info(f"Dump NVML events({len(self._nvml_events)}) finished")
+
+    def append(self, event: dict):
+        self._events_q.put(event)
+
+    def _dump_events_to_path(self, events: List[dict], output_path: str) -> None:
+        parent_dir = os.path.dirname(output_path)
         if parent_dir:
             # Ensure output directory exists. This makes repeated profiling
             # robust even if the user moves/deletes the profile directory.
@@ -374,15 +417,15 @@ class TraceManager:
         def _write_atomically() -> None:
             # Atomic replace avoids partial/corrupted files if the process exits
             # or errors out mid-write.
-            tmp_path = f"{self.output_path}.tmp.{os.getpid()}.{time.time_ns()}"
+            tmp_path = f"{output_path}.tmp.{os.getpid()}.{time.time_ns()}"
             try:
-                if self.output_path.endswith(".gz"):
+                if output_path.endswith(".gz"):
                     with gzip.open(tmp_path, "wt") as f:
                         f.write(payload)
                 else:
                     with open(tmp_path, "w") as f:
                         f.write(payload)
-                os.replace(tmp_path, self.output_path)
+                os.replace(tmp_path, output_path)
             finally:
                 try:
                     if os.path.exists(tmp_path):
@@ -404,8 +447,9 @@ class TraceManager:
                         "Profiling output is skipped for stability.",
                         exc_info=True,
                     )
-                    with self._dump_lock:
-                        self._pending_events = events + self._pending_events
+                    if output_path == self.output_path:
+                        with self._dump_lock:
+                            self._pending_events = events + self._pending_events
                     return
             else:
                 logger.warning(
@@ -413,22 +457,19 @@ class TraceManager:
                     "Profiling output is skipped for stability.",
                     exc_info=True,
                 )
-                with self._dump_lock:
-                    self._pending_events = events + self._pending_events
+                if output_path == self.output_path:
+                    with self._dump_lock:
+                        self._pending_events = events + self._pending_events
                 return
         except Exception:
             logger.warning(
                 "Failed to dump profiling events. Profiling output is skipped for stability.",
                 exc_info=True,
             )
-            with self._dump_lock:
-                self._pending_events = events + self._pending_events
+            if output_path == self.output_path:
+                with self._dump_lock:
+                    self._pending_events = events + self._pending_events
             return
-
-        logger.info(f"Dump events({len(events)}) finished")
-
-    def append(self, event: dict):
-        self._events_q.put(event)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -469,6 +510,7 @@ def init_trace_manager(
     if trace_manager is not None:
         trace_manager.stop_nvml_sampler()
         trace_manager.dump_events()
+        trace_manager.dump_nvml_events()
     trace_manager = TraceManager(
         prefix,
         output_dir,
@@ -488,6 +530,7 @@ def dump_trace_events():
     if trace_manager is not None:
         trace_manager.stop_nvml_sampler()
         trace_manager.dump_events()
+        trace_manager.dump_nvml_events()
 
 
 class ReqTraceStatus(IntEnum):
