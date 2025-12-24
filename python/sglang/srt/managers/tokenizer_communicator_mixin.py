@@ -334,7 +334,12 @@ class TokenizerCommunicatorMixin:
         if activities and "CUSTOM_PROFILER" in activities:
             if output_dir is None:
                 output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
-            init_trace_manager(f"tm_{profile_id}-", output_dir, force=True)
+            init_trace_manager(
+                f"tm_{profile_id}-",
+                output_dir,
+                force=True,
+                enable_nvml_sampler=False,
+            )
 
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
         with_stack = False if with_stack is False or env_with_stack is False else True

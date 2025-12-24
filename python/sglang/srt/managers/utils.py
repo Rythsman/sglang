@@ -185,7 +185,14 @@ def get_logprob_from_pp_outputs(
 
 
 class TraceManager:
-    def __init__(self, prefix: str, output_dir: str, tp_rank: int, pp_rank: int):
+    def __init__(
+        self,
+        prefix: str,
+        output_dir: str,
+        tp_rank: int,
+        pp_rank: int,
+        enable_nvml_sampler: bool = True,
+    ):
         # file_name = f"{prefix}custom_profiler.chrome_trace.json"
         file_name = f"{prefix}custom_profiler.trace.json.gz"
         self.output_path = os.path.join(output_dir, file_name)
@@ -195,12 +202,14 @@ class TraceManager:
         self.process_name = psutil.Process().name()
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
+        self.enable_nvml_sampler = enable_nvml_sampler
         self._nvml_sampler_stop: Optional[threading.Event] = None
         self._nvml_sampler_thread: Optional[threading.Thread] = None
 
         logger.info(f"Tracing events will be dumped to {self.output_path}")
         self._append_metadata()
-        self._maybe_start_nvml_sampler()
+        if self.enable_nvml_sampler:
+            self._maybe_start_nvml_sampler()
 
     def _append_metadata(self):
         """Append Chrome trace metadata events.
@@ -354,12 +363,23 @@ def init_trace_manager(
     tp_rank: int = 0,
     pp_rank: int = 0,
     force: bool = False,
+    enable_nvml_sampler: Optional[bool] = None,
 ):
     global trace_manager
+    if enable_nvml_sampler is None and trace_manager is not None:
+        enable_nvml_sampler = trace_manager.enable_nvml_sampler
+    if enable_nvml_sampler is None:
+        enable_nvml_sampler = True
     if trace_manager is None or force:
         if trace_manager is not None:
             trace_manager.stop_nvml_sampler()
-        trace_manager = TraceManager(prefix, output_dir, tp_rank, pp_rank)
+        trace_manager = TraceManager(
+            prefix,
+            output_dir,
+            tp_rank,
+            pp_rank,
+            enable_nvml_sampler=enable_nvml_sampler,
+        )
         return
 
     # Re-init if output file or ranks changed. This avoids silently writing new
@@ -374,7 +394,13 @@ def init_trace_manager(
         if trace_manager.events:
             trace_manager.dump_events()
         trace_manager.stop_nvml_sampler()
-        trace_manager = TraceManager(prefix, output_dir, tp_rank, pp_rank)
+        trace_manager = TraceManager(
+            prefix,
+            output_dir,
+            tp_rank,
+            pp_rank,
+            enable_nvml_sampler=enable_nvml_sampler,
+        )
 
 
 def get_trace_manager() -> Optional[TraceManager]:
