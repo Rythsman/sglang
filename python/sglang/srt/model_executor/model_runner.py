@@ -103,7 +103,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.utils import trace_batch_begin, trace_batch_end, trace_nvml_memory
+from sglang.srt.managers.utils import trace_batch_begin, trace_batch_end
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     DcpTokenToKVPoolAllocator,
@@ -2827,7 +2827,6 @@ class ModelRunner:
             },
             tid="ModelRunner::forward",
         )
-        trace_nvml_memory(tid="NVML::ModelRunner::forward")
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
