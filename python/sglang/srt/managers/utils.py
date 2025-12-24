@@ -5,7 +5,6 @@ import gzip
 import json
 import logging
 import os
-import queue
 import threading
 import time
 from enum import IntEnum, auto
@@ -199,13 +198,10 @@ class TraceManager:
         nvml_file_name = f"{prefix}custom_profiler.nvml.trace.json.gz"
         self.output_path = os.path.join(output_dir, main_file_name)
         self.nvml_output_path = os.path.join(output_dir, nvml_file_name)
-        # Multiple producer threads may append events (e.g. main thread + NVML sampler).
-        # Use a thread-safe queue to avoid per-event locking on the hot path.
-        self._events_q: queue.SimpleQueue[object] = queue.SimpleQueue()
-        # A buffer for events that failed to be written in a previous dump attempt.
-        # Protected by _dump_lock; append() never touches it.
-        self._pending_events: List[dict] = []
-        self._dump_lock = threading.Lock()
+        # Main trace events. Protected by a lock to avoid races between append()
+        # and dump_events(). This keeps the implementation simple and robust.
+        self.events: List[dict] = []
+        self._events_lock = threading.Lock()
         # NVML events are produced by a single background thread. We only read and dump them
         # after joining that thread, so no additional locking is needed.
         self._nvml_events: List[dict] = []
@@ -367,21 +363,9 @@ class TraceManager:
         never crash the serving loop (e.g. user moved/deleted the output dir).
         """
         logger.info(f"Dumpping events to {self.output_path}")
-        with self._dump_lock:
-            sentinel = _TraceEventQueueSentinel(token=time.time_ns())
-            # Mark the snapshot boundary. All events appended before this put()
-            # will appear before the sentinel and be drained in this dump.
-            self._events_q.put(sentinel)
-            drained: List[dict] = []
-            while True:
-                item = self._events_q.get()
-                if item is sentinel:
-                    break
-                # Only dicts are expected as events.
-                if isinstance(item, dict):
-                    drained.append(item)
-            events = self._pending_events + drained
-            self._pending_events = []
+        with self._events_lock:
+            events = self.events
+            self.events = []
 
         self._dump_events_to_path(events=events, output_path=self.output_path)
         logger.info(f"Dump events({len(events)}) finished")
@@ -403,7 +387,8 @@ class TraceManager:
         logger.info(f"Dump NVML events({len(self._nvml_events)}) finished")
 
     def append(self, event: dict):
-        self._events_q.put(event)
+        with self._events_lock:
+            self.events.append(event)
 
     def _dump_events_to_path(self, events: List[dict], output_path: str) -> None:
         parent_dir = os.path.dirname(output_path)
@@ -448,8 +433,8 @@ class TraceManager:
                         exc_info=True,
                     )
                     if output_path == self.output_path:
-                        with self._dump_lock:
-                            self._pending_events = events + self._pending_events
+                        with self._events_lock:
+                            self.events = events + self.events
                     return
             else:
                 logger.warning(
@@ -458,8 +443,8 @@ class TraceManager:
                     exc_info=True,
                 )
                 if output_path == self.output_path:
-                    with self._dump_lock:
-                        self._pending_events = events + self._pending_events
+                    with self._events_lock:
+                        self.events = events + self.events
                 return
         except Exception:
             logger.warning(
@@ -467,16 +452,9 @@ class TraceManager:
                 exc_info=True,
             )
             if output_path == self.output_path:
-                with self._dump_lock:
-                    self._pending_events = events + self._pending_events
+                with self._events_lock:
+                    self.events = events + self.events
             return
-
-
-@dataclasses.dataclass(frozen=True)
-class _TraceEventQueueSentinel:
-    """A unique marker object used to delimit a dump snapshot."""
-
-    token: int
 
 
 trace_manager: Optional[TraceManager] = None
