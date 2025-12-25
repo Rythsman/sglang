@@ -459,6 +459,21 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
 
+        # CUDA memory tracing (debug-only).
+        # Note: This runs in the scheduler process. It will not capture allocations in other processes.
+        self.enable_cuda_mem_trace = (
+            self.device == "cuda"
+            and self.is_entry_rank
+            and get_bool_env_var("SGLANG_SCHEDULER_CUDA_MEM_TRACE", "false")
+        )
+        self.cuda_mem_trace_every_n = max(
+            1, get_int_env_var("SGLANG_SCHEDULER_CUDA_MEM_TRACE_EVERY_N", 1)
+        )
+        # Synchronize CUDA before sampling to avoid missing short-lived peaks.
+        self.cuda_mem_trace_sync = get_bool_env_var(
+            "SGLANG_SCHEDULER_CUDA_MEM_TRACE_SYNC", "true"
+        )
+
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
         if self.dllm_config is not None:
@@ -2047,8 +2062,20 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
+                    self._trace_cuda_memory(
+                        stage="before_forward_generation",
+                        batch=batch,
+                        batch_or_worker_batch=model_worker_batch,
+                        reset_peak=True,
+                    )
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
+                    )
+                    self._trace_cuda_memory(
+                        stage="after_forward_generation",
+                        batch=batch,
+                        batch_or_worker_batch=model_worker_batch,
+                        reset_peak=False,
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(
@@ -2057,6 +2084,12 @@ class Scheduler(
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                        self._trace_cuda_memory(
+                            stage="after_copy_to_cpu",
+                            batch=batch,
+                            batch_or_worker_batch=model_worker_batch,
+                            reset_peak=False,
+                        )
                     else:
                         batch_result.future_indices = future_indices
 
@@ -2079,11 +2112,35 @@ class Scheduler(
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                self._trace_cuda_memory(
+                    stage="before_forward_split_prefill",
+                    batch=batch,
+                    batch_or_worker_batch=batch,
+                    reset_peak=True,
+                )
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                self._trace_cuda_memory(
+                    stage="after_forward_split_prefill",
+                    batch=batch,
+                    batch_or_worker_batch=batch,
+                    reset_peak=False,
+                )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
+                self._trace_cuda_memory(
+                    stage="before_forward_generation",
+                    batch=batch,
+                    batch_or_worker_batch=batch_or_worker_batch,
+                    reset_peak=True,
+                )
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
+                )
+                self._trace_cuda_memory(
+                    stage="after_forward_generation",
+                    batch=batch,
+                    batch_or_worker_batch=batch_or_worker_batch,
+                    reset_peak=False,
                 )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
@@ -2116,7 +2173,19 @@ class Scheduler(
             ret = batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
+            self._trace_cuda_memory(
+                stage="before_forward_embedding",
+                batch=batch,
+                batch_or_worker_batch=model_worker_batch,
+                reset_peak=True,
+            )
             embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
+            self._trace_cuda_memory(
+                stage="after_forward_embedding",
+                batch=batch,
+                batch_or_worker_batch=model_worker_batch,
+                reset_peak=False,
+            )
             ret = EmbeddingBatchResult(embeddings=embeddings)
 
         # Capture prefill end time for EXTEND mode
@@ -2126,6 +2195,98 @@ class Scheduler(
                 req.time_stats.prefill_end_time_host = current_time
 
         return ret
+
+    def _trace_cuda_memory(
+        self,
+        stage: str,
+        batch: Optional[ScheduleBatch],
+        batch_or_worker_batch: Optional[object],
+        reset_peak: bool,
+    ) -> None:
+        """Trace CUDA memory stats in scheduler process.
+
+        Comments are in English per style guide.
+        """
+        if not self.enable_cuda_mem_trace:
+            return
+        if self.forward_ct % self.cuda_mem_trace_every_n != 0:
+            return
+        if self.device != "cuda":
+            return
+
+        try:
+            if self.cuda_mem_trace_sync:
+                torch.cuda.synchronize()
+            if reset_peak:
+                torch.cuda.reset_peak_memory_stats()
+
+            allocated = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+            max_allocated = torch.cuda.max_memory_allocated()
+            max_reserved = torch.cuda.max_memory_reserved()
+            try:
+                free, total = torch.cuda.mem_get_info()
+            except Exception:
+                free, total = -1, -1
+
+            mm_reqs, mm_items = self._get_mm_counts(batch_or_worker_batch)
+            forward_mode = getattr(batch, "forward_mode", None)
+            forward_mode_str = (
+                forward_mode.name if forward_mode is not None else "UNKNOWN"
+            )
+            seq_lens_sum = getattr(batch_or_worker_batch, "seq_lens_sum", None)
+            bs = None
+            seq_lens = getattr(batch_or_worker_batch, "seq_lens", None)
+            if seq_lens is not None:
+                try:
+                    bs = int(seq_lens.shape[0])
+                except Exception:
+                    bs = None
+
+            logger.info(
+                "[cuda-mem-trace] "
+                f"pid={os.getpid()} "
+                f"gpu_id={self.gpu_id} "
+                f"stage={stage} "
+                f"step={self.forward_ct} "
+                f"mode={forward_mode_str} "
+                f"bs={bs} "
+                f"seq_lens_sum={seq_lens_sum} "
+                f"mm_reqs={mm_reqs} "
+                f"mm_items={mm_items} "
+                f"alloc_gb={allocated/1e9:.3f} "
+                f"reserved_gb={reserved/1e9:.3f} "
+                f"peak_alloc_gb={max_allocated/1e9:.3f} "
+                f"peak_reserved_gb={max_reserved/1e9:.3f} "
+                f"free_gb={(free/1e9) if free >= 0 else -1:.3f} "
+                f"total_gb={(total/1e9) if total >= 0 else -1:.3f}"
+            )
+        except Exception as e:
+            # Never break serving due to debug logging.
+            logger.warning(f"[cuda-mem-trace] failed at stage={stage}: {e}")
+
+    @staticmethod
+    def _get_mm_counts(batch_or_worker_batch: Optional[object]) -> Tuple[int, int]:
+        """Return (mm_reqs, mm_items) based on ModelWorkerBatch.multimodal_inputs."""
+        if batch_or_worker_batch is None:
+            return 0, 0
+        mm_inputs = getattr(batch_or_worker_batch, "multimodal_inputs", None)
+        if not mm_inputs:
+            return 0, 0
+
+        mm_reqs = 0
+        mm_items = 0
+        for mm in mm_inputs:
+            if mm is None:
+                continue
+            mm_reqs += 1
+            items = getattr(mm, "mm_items", None)
+            if items is not None:
+                try:
+                    mm_items += len(items)
+                except Exception:
+                    pass
+        return mm_reqs, mm_items
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
