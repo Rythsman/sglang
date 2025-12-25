@@ -473,6 +473,10 @@ class Scheduler(
         self.cuda_mem_trace_sync = get_bool_env_var(
             "SGLANG_SCHEDULER_CUDA_MEM_TRACE_SYNC", "true"
         )
+        # Whether to also sample NVML memory (device + current process).
+        self.cuda_mem_trace_nvml = get_bool_env_var(
+            "SGLANG_SCHEDULER_CUDA_MEM_TRACE_NVML", "true"
+        )
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -2228,6 +2232,7 @@ class Scheduler(
                 free, total = torch.cuda.mem_get_info()
             except Exception:
                 free, total = -1, -1
+            nvml_proc_used, nvml_dev_used, nvml_dev_total = self._get_nvml_mem_bytes()
 
             mm_reqs, mm_items = self._get_mm_counts(batch_or_worker_batch)
             forward_mode = getattr(batch, "forward_mode", None)
@@ -2258,12 +2263,57 @@ class Scheduler(
                 f"reserved_gb={reserved/1e9:.3f} "
                 f"peak_alloc_gb={max_allocated/1e9:.3f} "
                 f"peak_reserved_gb={max_reserved/1e9:.3f} "
+                f"nvml_proc_used_gb={(nvml_proc_used/1e9) if nvml_proc_used >= 0 else -1:.3f} "
+                f"nvml_dev_used_gb={(nvml_dev_used/1e9) if nvml_dev_used >= 0 else -1:.3f} "
+                f"nvml_dev_total_gb={(nvml_dev_total/1e9) if nvml_dev_total >= 0 else -1:.3f} "
                 f"free_gb={(free/1e9) if free >= 0 else -1:.3f} "
                 f"total_gb={(total/1e9) if total >= 0 else -1:.3f}"
             )
         except Exception as e:
             # Never break serving due to debug logging.
             logger.warning(f"[cuda-mem-trace] failed at stage={stage}: {e}")
+
+    def _get_nvml_mem_bytes(self) -> Tuple[int, int, int]:
+        """Return (proc_used, dev_used, dev_total) in bytes using NVML.
+
+        This helps distinguish Torch allocator usage vs non-Torch GPU allocations.
+        """
+        if not self.cuda_mem_trace_nvml:
+            return -1, -1, -1
+        if self.device != "cuda":
+            return -1, -1, -1
+
+        try:
+            # Prefer system pynvml if available.
+            try:
+                import pynvml  # type: ignore
+            except Exception:
+                from sglang.multimodal_gen.third_party import pynvml  # type: ignore
+
+            if not hasattr(self, "_nvml_inited"):
+                pynvml.nvmlInit()
+                setattr(self, "_nvml_inited", True)
+
+            handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_id)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            dev_used = int(getattr(mem, "used", -1))
+            dev_total = int(getattr(mem, "total", -1))
+
+            proc_used = -1
+            try:
+                procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+                pid = os.getpid()
+                for p in procs:
+                    if int(getattr(p, "pid", -1)) == pid:
+                        used = getattr(p, "usedGpuMemory", -1)
+                        proc_used = int(used) if used is not None else -1
+                        break
+            except Exception:
+                proc_used = -1
+
+            return proc_used, dev_used, dev_total
+        except Exception:
+            return -1, -1, -1
 
     @staticmethod
     def _get_mm_counts(batch_or_worker_batch: Optional[object]) -> Tuple[int, int]:
