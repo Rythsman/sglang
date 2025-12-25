@@ -20,6 +20,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
@@ -477,6 +478,12 @@ class Scheduler(
         self.cuda_mem_trace_nvml = get_bool_env_var(
             "SGLANG_SCHEDULER_CUDA_MEM_TRACE_NVML", "true"
         )
+        # Whether to log empty_cache() callsites in scheduler process.
+        self.trace_empty_cache_calls = get_bool_env_var(
+            "SGLANG_SCHEDULER_TRACE_EMPTY_CACHE", "false"
+        )
+        if self.trace_empty_cache_calls:
+            self._install_empty_cache_hook()
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -2233,6 +2240,23 @@ class Scheduler(
             except Exception:
                 free, total = -1, -1
             nvml_proc_used, nvml_dev_used, nvml_dev_total = self._get_nvml_mem_bytes()
+            stats = torch.cuda.memory_stats()
+            num_alloc_retries = int(stats.get("num_alloc_retries", -1))
+            num_ooms = int(stats.get("num_ooms", -1))
+            last_alloc_retries = getattr(self, "_last_num_alloc_retries", None)
+            last_ooms = getattr(self, "_last_num_ooms", None)
+            delta_alloc_retries = (
+                num_alloc_retries - last_alloc_retries
+                if last_alloc_retries is not None and num_alloc_retries >= 0
+                else -1
+            )
+            delta_ooms = (
+                num_ooms - last_ooms
+                if last_ooms is not None and num_ooms >= 0
+                else -1
+            )
+            self._last_num_alloc_retries = num_alloc_retries
+            self._last_num_ooms = num_ooms
 
             mm_reqs, mm_items = self._get_mm_counts(batch_or_worker_batch)
             forward_mode = getattr(batch, "forward_mode", None)
@@ -2263,6 +2287,10 @@ class Scheduler(
                 f"reserved_gb={reserved/1e9:.3f} "
                 f"peak_alloc_gb={max_allocated/1e9:.3f} "
                 f"peak_reserved_gb={max_reserved/1e9:.3f} "
+                f"alloc_retries={num_alloc_retries} "
+                f"ooms={num_ooms} "
+                f"delta_alloc_retries={delta_alloc_retries} "
+                f"delta_ooms={delta_ooms} "
                 f"nvml_proc_used_gb={(nvml_proc_used/1e9) if nvml_proc_used >= 0 else -1:.3f} "
                 f"nvml_dev_used_gb={(nvml_dev_used/1e9) if nvml_dev_used >= 0 else -1:.3f} "
                 f"nvml_dev_total_gb={(nvml_dev_total/1e9) if nvml_dev_total >= 0 else -1:.3f} "
@@ -2272,6 +2300,54 @@ class Scheduler(
         except Exception as e:
             # Never break serving due to debug logging.
             logger.warning(f"[cuda-mem-trace] failed at stage={stage}: {e}")
+
+    def _install_empty_cache_hook(self) -> None:
+        """Wrap torch.cuda.empty_cache() to log callsites.
+
+        This is debug-only and should be disabled in production due to overhead.
+        """
+        if getattr(self, "_empty_cache_hooked", False):
+            return
+        if self.device != "cuda":
+            return
+
+        try:
+            orig = torch.cuda.empty_cache
+        except Exception:
+            return
+
+        def wrapped_empty_cache():
+            stack = "".join(traceback.format_stack(limit=50))
+            try:
+                before_reserved = torch.cuda.memory_reserved()
+                before_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                before_reserved = -1
+                before_alloc = -1
+
+            try:
+                return orig()
+            finally:
+                try:
+                    after_reserved = torch.cuda.memory_reserved()
+                    after_alloc = torch.cuda.memory_allocated()
+                except Exception:
+                    after_reserved = -1
+                    after_alloc = -1
+                logger.warning(
+                    "[empty-cache-trace] "
+                    f"pid={os.getpid()} "
+                    f"gpu_id={self.gpu_id} "
+                    f"step={getattr(self, 'forward_ct', -1)} "
+                    f"reserved_gb_before={(before_reserved/1e9) if before_reserved >= 0 else -1:.3f} "
+                    f"reserved_gb_after={(after_reserved/1e9) if after_reserved >= 0 else -1:.3f} "
+                    f"alloc_gb_before={(before_alloc/1e9) if before_alloc >= 0 else -1:.3f} "
+                    f"alloc_gb_after={(after_alloc/1e9) if after_alloc >= 0 else -1:.3f} "
+                    f"stack=\n{stack}"
+                )
+
+        torch.cuda.empty_cache = wrapped_empty_cache
+        self._empty_cache_hooked = True
 
     def _get_nvml_mem_bytes(self) -> Tuple[int, int, int]:
         """Return (proc_used, dev_used, dev_total) in bytes using NVML.
