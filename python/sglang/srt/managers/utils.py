@@ -212,6 +212,16 @@ class TraceManager:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.enable_nvml_sampler = enable_nvml_sampler
+        # NOTE: CUDA "current device" is thread-local. The NVML sampler runs in a
+        # background thread, so we must record the intended device index in the
+        # main thread and explicitly set it in the sampler thread before calling
+        # torch.cuda memory APIs; otherwise non-zero ranks often read device 0.
+        self._torch_device_index: Optional[int] = None
+        if torch.cuda.is_available():
+            try:
+                self._torch_device_index = torch.cuda.current_device()
+            except Exception:
+                self._torch_device_index = None
         self._nvml_sampler_stop: Optional[threading.Event] = None
         self._nvml_sampler_thread: Optional[threading.Thread] = None
 
@@ -318,7 +328,9 @@ class TraceManager:
     def _nvml_sampler_loop(self, stop: threading.Event, interval_s: float):
         tid = f"NVML TP{self.tp_rank} PP{self.pp_rank}"
         while not stop.is_set():
-            self._trace_nvml_memory_counter(tid=tid)
+            self._trace_nvml_memory_counter(
+                tid=tid, device_index=self._torch_device_index
+            )
             stop.wait(interval_s)
 
     def append_nvml(self, event: dict) -> None:
@@ -330,19 +342,15 @@ class TraceManager:
             return
         if not _ensure_nvml_inited():
             return
-
         if device_index is None:
-            try:
-                device_index = torch.cuda.current_device()
-            except Exception:
-                return
+            return
         try:
             handle = _get_nvml_handle(device_index)
             mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            allocated = torch.cuda.memory_allocated()
-            reserved = torch.cuda.memory_reserved()
-            max_allocated = torch.cuda.max_memory_allocated()
-            max_reserved = torch.cuda.max_memory_reserved()
+            allocated = torch.cuda.memory_allocated(device_index)
+            reserved = torch.cuda.memory_reserved(device_index)
+            max_allocated = torch.cuda.max_memory_allocated(device_index)
+            max_reserved = torch.cuda.max_memory_reserved(device_index)
         except Exception:
             return
 
