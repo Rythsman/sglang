@@ -339,6 +339,10 @@ class TraceManager:
         try:
             handle = _get_nvml_handle(device_index)
             mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            allocated = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+            max_allocated = torch.cuda.max_memory_allocated()
+            max_reserved = torch.cuda.max_memory_reserved()
         except Exception:
             return
 
@@ -354,6 +358,10 @@ class TraceManager:
                     "used_bytes": mem.used * _BYTES_TO_GIB,
                     "free_bytes": mem.free * _BYTES_TO_GIB,
                     "total_bytes": mem.total * _BYTES_TO_GIB,
+                    "torch_cuda_alloc_bytes": allocated * _BYTES_TO_GIB,
+                    "torch_cuda_reserved": reserved * _BYTES_TO_GIB,
+                    "torch_cuda_max_allocated": max_allocated * _BYTES_TO_GIB,
+                    "torch_cuda_max_reserved": max_reserved * _BYTES_TO_GIB,
                 },
             }
         )

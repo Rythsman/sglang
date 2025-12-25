@@ -734,14 +734,14 @@ def general_mm_embed_routine(
         else:
             input_embeds = None
 
-    trace_batch_begin(BatchTraceStatus.PREFILL, tid="general_mm_embed_routine")
+    trace_batch_begin(forward_batch.forward_mode, tid="general_mm_embed_routine")
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
         input_embeds=input_embeds,
         **kwargs,
     )
-    trace_batch_end(BatchTraceStatus.PREFILL, tid="general_mm_embed_routine")
+    trace_batch_end(forward_batch.forward_mode, tid="general_mm_embed_routine")
     return hidden_states
 
 
