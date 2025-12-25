@@ -203,6 +203,16 @@ class TraceManager:
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.enable_nvml_sampler = enable_nvml_sampler
+        # NOTE: CUDA "current device" is thread-local. The NVML sampler runs in a
+        # background thread, so we must record the intended device index in the
+        # main thread and explicitly set it in the sampler thread before calling
+        # torch.cuda memory APIs; otherwise non-zero ranks often read device 0.
+        self._torch_device_index: Optional[int] = None
+        if torch.cuda.is_available():
+            try:
+                self._torch_device_index = torch.cuda.current_device()
+            except Exception:
+                self._torch_device_index = None
         self._nvml_sampler_stop: Optional[threading.Event] = None
         self._nvml_sampler_thread: Optional[threading.Thread] = None
 
@@ -297,7 +307,9 @@ class TraceManager:
     def _nvml_sampler_loop(self, stop: threading.Event, interval_s: float):
         tid = f"NVML TP{self.tp_rank} PP{self.pp_rank}"
         while not stop.is_set():
-            self._trace_nvml_memory_counter(tid=tid)
+            self._trace_nvml_memory_counter(
+                tid=tid, device_index=self._torch_device_index
+            )
             stop.wait(interval_s)
 
     def _trace_nvml_memory_counter(self, tid: str, device_index: Optional[int] = None):
@@ -318,6 +330,23 @@ class TraceManager:
         except Exception:
             return
 
+        # Torch CUDA allocator stats are process-local (unlike NVML, which is device-global).
+        # Ensure we read the right device in this sampler thread.
+        torch_allocated_gib: Optional[float] = None
+        torch_reserved_gib: Optional[float] = None
+        try:
+            torch.cuda.set_device(device_index)
+            torch_allocated_gib = (
+                float(torch.cuda.memory_allocated(device_index)) * _BYTES_TO_GIB
+            )
+            torch_reserved_gib = (
+                float(torch.cuda.memory_reserved(device_index)) * _BYTES_TO_GIB
+            )
+        except Exception:
+            # Keep NVML counters even if torch allocator stats are unavailable.
+            torch_allocated_gib = None
+            torch_reserved_gib = None
+
         self.append(
             {
                 "cat": "NVML Memory",
@@ -330,6 +359,9 @@ class TraceManager:
                     "used_bytes": mem.used * _BYTES_TO_GIB,
                     "free_bytes": mem.free * _BYTES_TO_GIB,
                     "total_bytes": mem.total * _BYTES_TO_GIB,
+                    # Torch memory stats are reported in GiB for consistency.
+                    "torch_allocated_gib": torch_allocated_gib,
+                    "torch_reserved_gib": torch_reserved_gib,
                 },
             }
         )
