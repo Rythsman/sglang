@@ -675,7 +675,7 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
-    @trace_execution_time(tid="reduce_scatter")
+    @trace_execution_time()
     def reduce_scatter_along_dim(
         self, input_: torch.Tensor, dim: int = -1
     ) -> torch.Tensor:
