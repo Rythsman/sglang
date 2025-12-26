@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import functools
 import gzip
 import json
@@ -8,7 +9,7 @@ import os
 import threading
 import time
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Union
 
 import psutil
 
@@ -28,8 +29,91 @@ SAMPLE_INTERVAL_MS = int(os.environ.get("SGLANG_GPU_STATS_SAMPLE_INTERVAL_MS", 5
 SAMPLE_INTERVAL_SEC = SAMPLE_INTERVAL_MS / 1000.0
 MICROSECONDS_PER_SECOND = 1_000_000.0
 BYTES_TO_GIBIBYTE = 1024**3
+ENABLE_TORCH_GPU_STATS = os.environ.get("SGLANG_GPU_STATS_ENABLE_TORCH", "0") == "1"
+MAX_GPU_STATS_EVENTS = int(os.environ.get("SGLANG_GPU_STATS_MAX_EVENTS", 100_000))
 
 _global_stats: Dict[int, Dict[str, Any]] = {}
+
+_nvml_lock = threading.Lock()
+_nvml_refcount = 0
+_nvml_initialized = False
+
+
+def _nvml_acquire() -> bool:
+    """Initialize NVML once and increment refcount.
+
+    Returns:
+        True if NVML is ready to use, otherwise False.
+    """
+    global _nvml_refcount, _nvml_initialized
+    if pynvml is None:
+        return False
+
+    with _nvml_lock:
+        try:
+            if not _nvml_initialized:
+                pynvml.nvmlInit()
+                _nvml_initialized = True
+            _nvml_refcount += 1
+            return True
+        except Exception as exc:
+            logger.error("Failed to initialize NVML: %s", exc)
+            _nvml_initialized = False
+            _nvml_refcount = 0
+            return False
+
+
+def _nvml_release() -> None:
+    """Decrement refcount and shutdown NVML when unused."""
+    global _nvml_refcount, _nvml_initialized
+    if pynvml is None:
+        return
+
+    with _nvml_lock:
+        if _nvml_refcount <= 0:
+            return
+        _nvml_refcount -= 1
+        if _nvml_refcount != 0:
+            return
+
+        if not _nvml_initialized:
+            return
+
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            # Best-effort cleanup.
+            pass
+        finally:
+            _nvml_initialized = False
+
+
+def _maybe_get_torch_gpu_mem_bytes(gpu_id: int) -> Optional[Dict[str, float]]:
+    """Fetch torch CUDA memory metrics, optionally.
+
+    Notes:
+        This is opt-in via env var to avoid accidentally initializing CUDA
+        context in processes that do not otherwise use torch.
+    """
+    if not ENABLE_TORCH_GPU_STATS:
+        return None
+
+    try:
+        import torch  # Imported lazily on purpose.
+    except Exception:
+        return None
+
+    try:
+        if not torch.cuda.is_available():
+            return None
+        if gpu_id < 0 or gpu_id >= torch.cuda.device_count():
+            return None
+        return {
+            "torch_allocated_bytes": float(torch.cuda.memory_allocated(gpu_id)),
+            "torch_reserved_bytes": float(torch.cuda.memory_reserved(gpu_id)),
+        }
+    except Exception:
+        return None
 
 
 class GPUStatsMonitor:
@@ -39,23 +123,35 @@ class GPUStatsMonitor:
         gpu_id: GPU device ID to monitor
     """
 
-    def __init__(self, gpu_id: int, pid) -> None:
-        if pynvml is None:
-            self._available = False
+    def __init__(self, gpu_id: int, pid: Union[str, int]) -> None:
+        self._pid = pid
+        self._gpu_id = gpu_id
+
+        self._available = False
+        self._nvml_acquired = False
+        self._handle = None
+
+        self._events: Deque[dict] = deque(maxlen=max(1, MAX_GPU_STATS_EVENTS))
+        self._events_lock = threading.Lock()
+
+        self._running = False
+        self._stop_event = threading.Event()
+        self._ready_event: Optional[threading.Event] = None
+        self._thread: Optional[threading.Thread] = None
+        self._last_error_log_s = 0.0
+
+        if not _nvml_acquire():
             return
 
-        self._pid = pid
-        self._available = True
-        self._events: List[dict] = []
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-
+        self._nvml_acquired = True
         try:
-            pynvml.nvmlInit()
             self._handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
-        except Exception as e:
-            logger.error(f"Failed to initialize NVML: {e}")
+            self._available = True
+        except Exception as exc:
+            logger.error("Failed to get NVML handle for GPU %s: %s", gpu_id, exc)
             self._available = False
+            _nvml_release()
+            self._nvml_acquired = False
 
     def start(self) -> None:
         """Start the monitoring thread"""
@@ -65,30 +161,39 @@ class GPUStatsMonitor:
         if self._running:
             return
         self._running = True
+        self._stop_event.clear()
         self._ready_event = threading.Event()
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
-        self._ready_event.wait(timeout=5.0)
+        if not self._ready_event.wait(timeout=5.0):
+            logger.warning(
+                "GPUStatsMonitor did not become ready within timeout (gpu_id=%s).",
+                self._gpu_id,
+            )
 
     def stop(self) -> None:
         """Stop the monitoring thread"""
         if not self._running:
             return
         self._running = False
+        self._stop_event.set()
 
-        # Wait outside the lock to avoid deadlock
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-        if self._ready_event is not None:
-            self._ready_event.clear()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5.0)
+        self._thread = None
+        self._ready_event = None
 
     def _sample_loop(self) -> None:
         """Background sampling loop with precise timing"""
-        self._ready_event.set()
-        while self._running:
-            next_tick = time.time() + SAMPLE_INTERVAL_SEC
-
+        is_ready = False
+        next_tick = time.perf_counter()
+        while self._running and not self._stop_event.is_set():
+            next_tick += SAMPLE_INTERVAL_SEC
             try:
+                if self._handle is None:
+                    raise RuntimeError("NVML handle is not initialized.")
+
                 mem_info = pynvml.nvmlDeviceGetMemoryInfo(self._handle)
                 util = pynvml.nvmlDeviceGetUtilizationRates(self._handle)
                 temp = pynvml.nvmlDeviceGetTemperature(
@@ -103,6 +208,14 @@ class GPUStatsMonitor:
                     "memory_util_p": util.memory,
                     "temperature_c": temp,
                 }
+                torch_mem = _maybe_get_torch_gpu_mem_bytes(self._gpu_id)
+                if torch_mem is not None:
+                    payload["torch_allocated_gb"] = round(
+                        torch_mem["torch_allocated_bytes"] / BYTES_TO_GIBIBYTE, 2
+                    )
+                    payload["torch_reserved_gb"] = round(
+                        torch_mem["torch_reserved_bytes"] / BYTES_TO_GIBIBYTE, 2
+                    )
 
                 event = _create_trace_event(
                     cat="gpu_stats",
@@ -113,23 +226,32 @@ class GPUStatsMonitor:
                     ts=time.time(),
                     args=payload,
                 )
-                self._events.append(event)
+                with self._events_lock:
+                    self._events.append(event)
+                if not is_ready and self._ready_event is not None:
+                    self._ready_event.set()
+                    is_ready = True
 
-            except Exception as e:
-                logger.error(f"Error sampling GPU stats: {e}")
+            except Exception as exc:
+                now_s = time.time()
+                # Avoid spamming logs if NVML is temporarily unhappy.
+                if now_s - self._last_error_log_s >= 10.0:
+                    logger.error("Error sampling GPU stats: %s", exc)
+                    self._last_error_log_s = now_s
 
-            # Precise interval control
-            sleep_time = next_tick - time.time()
+            # Precise interval control with interruptible wait.
+            sleep_time = next_tick - time.perf_counter()
             if sleep_time > 0:
-                time.sleep(sleep_time)
+                self._stop_event.wait(timeout=sleep_time)
 
     def take_events(self) -> list[dict]:
         """Retrieve and clear collected events"""
-        if not self._available or self._running:
+        if not self._available:
             return []
 
-        events = self._events
-        self._events = []
+        with self._events_lock:
+            events = list(self._events)
+            self._events.clear()
         return events
 
     def __enter__(self) -> "GPUStatsMonitor":
@@ -143,13 +265,15 @@ class GPUStatsMonitor:
 
     def __del__(self) -> None:
         """Safely cleanup NVML resources"""
-        if not self._available or pynvml is None:
-            return
-
         try:
-            pynvml.nvmlShutdown()
+            self.stop()
         except Exception:
+            # Best-effort cleanup.
             pass
+        finally:
+            if self._nvml_acquired:
+                _nvml_release()
+                self._nvml_acquired = False
 
 
 class TraceManager:
