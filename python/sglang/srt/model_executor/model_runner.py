@@ -2529,8 +2529,8 @@ class ModelRunner:
         )
         trace_global_stats(
             {
-                f"after_capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'}"
-                f"mem "
+                f"after_capture_graph_memory(GB)": after_mem,
+                f"capture_graph_usage(GB)": self.graph_mem_usage,
             }
         )
 
