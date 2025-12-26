@@ -2527,6 +2527,12 @@ class ModelRunner:
             f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+        trace_global_stats(
+            {
+                f"after_capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'}"
+                f"mem "
+            }
+        )
 
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""

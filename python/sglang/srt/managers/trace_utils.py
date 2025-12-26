@@ -516,8 +516,6 @@ def trace_execution_time(name: Optional[str] = None) -> Callable:
     Args:
         name: Function name for tracing
     """
-    if _trace_manager is None or not _trace_manager.enable:
-        return lambda func: func
 
     def decorator(func: Callable) -> Callable:
         event_name = name or func.__name__
@@ -527,6 +525,11 @@ def trace_execution_time(name: Optional[str] = None) -> Callable:
             start_time = time.time()
             result = func(*args, **kwargs)
             end_time = time.time()
+
+            global _trace_manager
+            if _trace_manager is None or not _trace_manager.enable:
+                return result
+
             event = _create_trace_event(
                 cat=event_name,
                 name=event_name,
