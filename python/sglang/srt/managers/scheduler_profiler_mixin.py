@@ -8,7 +8,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
-from sglang.srt.managers.utils import dump_trace_events, init_trace_manager
+from sglang.srt.managers.trace_utils import (
+    init_trace_manager,
+    start_trace_profile,
+    stop_trace_profile,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
@@ -139,7 +143,13 @@ class SchedulerProfilerMixin:
             if self.pp_rank > 1:
                 prefix += f"-PP-{self.pp_rank}-"
 
-            init_trace_manager(prefix, output_dir, self.tp_rank, self.pp_rank)
+            init_trace_manager(
+                prefix,
+                output_dir,
+                self.attn_tp_rank,
+                self.pp_rank,
+                self.gpu_id,
+            )
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
@@ -221,6 +231,7 @@ class SchedulerProfilerMixin:
             self.profile_in_progress = True
 
         if "CUSTOM_PROFILER" in activities:
+            start_trace_profile()
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -333,7 +344,7 @@ class SchedulerProfilerMixin:
                 torch.cuda.cudart().cudaProfilerStop()
 
         if "CUSTOM_PROFILER" in self.profiler_activities:
-            dump_trace_events()
+            stop_trace_profile()
 
         merge_message = self._merge_profile_traces()
 

@@ -22,7 +22,7 @@ import threading
 import time
 from collections import deque
 from concurrent import futures
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -150,14 +150,14 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
-from sglang.srt.managers.utils import (
-    GenerationBatchResult,
+from sglang.srt.managers.trace_utils import (
     ReqTraceStatus,
     get_trace_manager,
+    trace_global_stats,
     trace_req_begin,
     trace_req_end,
-    validate_input_length,
 )
+from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -278,6 +278,7 @@ class Scheduler(
             server_args.speculative_algorithm
         )
         self.gpu_id = gpu_id
+        trace_global_stats({"gpu_id": gpu_id})
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
@@ -375,6 +376,17 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        trace_global_stats(
+            {
+                "max_total_num_tokens": self.max_total_num_tokens,
+                "max_prefill_tokens": self.max_prefill_tokens,
+                "max_running_requests": self.max_running_requests,
+                "max_queued_requests": self.max_queued_requests,
+                "max_req_len": self.max_req_len,
+                "max_req_input_len": self.max_req_input_len,
+                "device": self.device,
+            }
+        )
         if get_global_server_args().pp_max_micro_batch_size is None:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // server_args.pp_size, 1
@@ -471,6 +483,12 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
+        trace_global_stats(
+            {
+                "chunked_prefill_size": self.chunked_prefill_size,
+                "is_mixed_chunk": self.is_mixed_chunk,
+            }
+        )
 
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
@@ -546,6 +564,7 @@ class Scheduler(
         # Init mlp sync flag
         self.require_mlp_sync = require_mlp_sync(server_args)
 
+        trace_global_stats({"server_args": asdict(self.server_args)})
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -830,6 +849,7 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+        trace_global_stats({"embedding_cache_size_MB": embedding_cache_size})
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(

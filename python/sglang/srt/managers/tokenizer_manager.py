@@ -78,10 +78,9 @@ from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
-from sglang.srt.managers.utils import (
+from sglang.srt.managers.trace_utils import (
     ReqTraceStatus,
     extract_mm_info,
-    get_trace_manager,
     trace_req_begin,
     trace_req_end,
 )
@@ -1079,9 +1078,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
-        if get_trace_manager() is not None:
-            for tokenized_obj in tokenized_objs:
-                trace_req_begin(tokenized_obj.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
+        for tokenized_obj in tokenized_objs:
+            trace_req_begin(tokenized_obj.rid, ReqTraceStatus.PRE_SCHEDULER_COMM)
 
         self.send_to_scheduler.send_pyobj(batch_req)
         # Create states for each individual request in the batch

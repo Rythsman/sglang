@@ -40,6 +40,7 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.trace_utils import trace_execution_time
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
@@ -559,6 +560,7 @@ class GroupCoordinator:
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
+    @trace_execution_time()
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -673,6 +675,7 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
+    @trace_execution_time(tid="reduce_scatter")
     def reduce_scatter_along_dim(
         self, input_: torch.Tensor, dim: int = -1
     ) -> torch.Tensor:
@@ -725,6 +728,7 @@ class GroupCoordinator:
             )
         return output
 
+    @trace_execution_time()
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu or not supports_custom_op():
             self._reduce_scatter_tensor(output, input)
@@ -733,6 +737,7 @@ class GroupCoordinator:
                 output, input, group_name=self.unique_name
             )
 
+    @trace_execution_time()
     def reduce_scatter(
         self,
         output: torch.Tensor,
@@ -791,6 +796,7 @@ class GroupCoordinator:
                 output, input, group=self.device_group
             )
 
+    @trace_execution_time()
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu or _is_xpu or not _supports_custom_op:
             self._all_gather_into_tensor(output, input)
@@ -820,6 +826,7 @@ class GroupCoordinator:
                 output, input, group_name=self.unique_name
             )
 
+    @trace_execution_time()
     def all_gather(
         self,
         input_: torch.Tensor,
@@ -983,6 +990,7 @@ class GroupCoordinator:
             output_tensor = None
         return output_tensor
 
+    @trace_execution_time()
     def broadcast(self, input_: torch.Tensor, src: int = 0):
         """Broadcast the input tensor.
         NOTE: `src` is the local rank of the source rank.

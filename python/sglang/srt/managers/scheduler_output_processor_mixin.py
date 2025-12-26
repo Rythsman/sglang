@@ -20,7 +20,11 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
     ScheduleBatch,
 )
-from sglang.srt.managers.utils import ReqTraceStatus, trace_req_begin, trace_req_end
+from sglang.srt.managers.trace_utils import (
+    ReqTraceStatus,
+    trace_req_begin,
+    trace_req_end,
+)
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 

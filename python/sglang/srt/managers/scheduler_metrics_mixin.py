@@ -11,7 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
-from sglang.srt.managers.utils import ReqTraceStatus, trace_req_end, trace_usage
+from sglang.srt.managers.trace_utils import ReqTraceStatus, trace_req_end, trace_usage
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.utils import get_bool_env_var
 

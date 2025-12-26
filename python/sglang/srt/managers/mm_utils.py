@@ -19,7 +19,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.managers.utils import (
+from sglang.srt.managers.trace_utils import (
     BatchTraceStatus,
     trace_batch_begin,
     trace_batch_end,
@@ -390,6 +390,21 @@ def _get_chunked_prefill_embedding(
         embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
         embedding_per_req = embedding_cache.get(item_hashes)
         if embedding_per_req is None:
+            trace_batch_begin(
+                "ReqEmbedding",
+                extra_info={
+                    "hash": embedding_items_hash,
+                    "modality": embedding_items_per_req[0].modality.name,
+                    "num_items": len(embedding_items_per_req),
+                },
+                tid="req_embedding",
+            )
+            embedding_per_req = data_embedding_func(embedding_items_per_req)
+            trace_batch_end(
+                "ReqEmbedding",
+                tid="req_embedding",
+                extra_info={"embedding_shape": embedding_per_req.shape},
+            )
             embedding_per_req = data_embedding_func(embedding_items_per_req)
             if not embedding_cache.set(embedding_items_hash, embedding_per_req):
                 print_warning_once(
