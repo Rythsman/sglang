@@ -11,6 +11,7 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import psutil
+import torch
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -49,6 +50,8 @@ class GPUStatsMonitor:
         self._events: List[dict] = []
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._gpu_id = gpu_id
+        self._stop_event = threading.Event()
 
         try:
             pynvml.nvmlInit()
@@ -65,6 +68,7 @@ class GPUStatsMonitor:
         if self._running:
             return
         self._running = True
+        self._stop_event.clear()
         self._ready_event = threading.Event()
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
@@ -75,6 +79,7 @@ class GPUStatsMonitor:
         if not self._running:
             return
         self._running = False
+        self._stop_event.set()
 
         # Wait outside the lock to avoid deadlock
         if self._thread is not None:
@@ -85,8 +90,9 @@ class GPUStatsMonitor:
     def _sample_loop(self) -> None:
         """Background sampling loop with precise timing"""
         self._ready_event.set()
-        while self._running:
-            next_tick = time.time() + SAMPLE_INTERVAL_SEC
+        next_tick = time.perf_counter()
+        while self._running and not self._stop_event.is_set():
+            next_tick += SAMPLE_INTERVAL_SEC
 
             try:
                 mem_info = pynvml.nvmlDeviceGetMemoryInfo(self._handle)
@@ -94,11 +100,19 @@ class GPUStatsMonitor:
                 temp = pynvml.nvmlDeviceGetTemperature(
                     self._handle, pynvml.NVML_TEMPERATURE_GPU
                 )
-
+                # torch related
+                torch_allocated_gb = float(torch.cuda.memory_allocated(self._gpu_id))
+                torch_reserved_gb = float(torch.cuda.memory_reserved(self._gpu_id))
                 payload = {
-                    "memory_used_gb": round(mem_info.used / BYTES_TO_GIBIBYTE, 2),
                     "memory_total_gb": round(mem_info.total / BYTES_TO_GIBIBYTE, 2),
                     "memory_free_gb": round(mem_info.free / BYTES_TO_GIBIBYTE, 2),
+                    "memory_used_gb": round(mem_info.used / BYTES_TO_GIBIBYTE, 2),
+                    "torch_allocated_gb": round(
+                        torch_allocated_gb / BYTES_TO_GIBIBYTE, 2
+                    ),
+                    "torch_reserved_gb": round(
+                        torch_reserved_gb / BYTES_TO_GIBIBYTE, 2
+                    ),
                     "gpu_util_p": util.gpu,
                     "memory_util_p": util.memory,
                     "temperature_c": temp,
@@ -119,9 +133,9 @@ class GPUStatsMonitor:
                 logger.error(f"Error sampling GPU stats: {e}")
 
             # Precise interval control
-            sleep_time = next_tick - time.time()
+            sleep_time = next_tick - time.perf_counter()
             if sleep_time > 0:
-                time.sleep(sleep_time)
+                self._stop_event.wait(timeout=sleep_time)
 
     def take_events(self) -> list[dict]:
         """Retrieve and clear collected events"""
