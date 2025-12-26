@@ -185,7 +185,7 @@ class TraceManager:
         pp_rank: int,
         gpu_id: Optional[int] = None,
     ) -> None:
-        file_name = f"{prefix}custom_profiler.chrome_trace.json"
+        file_name = f"{prefix}custom_profiler.chrome_trace.json.gz"
         self._output_path = os.path.join(output_dir, file_name)
         self._events: list[dict] = []
         self.pid = f"{prefix}{psutil.Process().pid}"
