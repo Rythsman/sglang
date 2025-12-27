@@ -27,12 +27,12 @@ except Exception:
     pynvml = None
 
 # Constants
-SAMPLE_INTERVAL_MS = int(os.environ.get("SGLANG_GPU_STATS_SAMPLE_INTERVAL_MS", 500))
+SAMPLE_INTERVAL_MS = envs.SGLANG_GPU_STATS_SAMPLE_INTERVAL_MS.get()
 SAMPLE_INTERVAL_SEC = SAMPLE_INTERVAL_MS / 1000.0
 MICROSECONDS_PER_SECOND = 1_000_000.0
 BYTES_TO_GIBIBYTE = 1024**3
 
-_global_stats: Dict[int, Dict[str, Any]] = {}
+_global_stats: Dict[str, Any] = {}
 
 
 class GPUStatsMonitor:
@@ -43,24 +43,35 @@ class GPUStatsMonitor:
     """
 
     def __init__(self, gpu_id: int, pid) -> None:
-        if pynvml is None:
-            self._available = False
-            return
-
+        # Always initialize all attributes first
         self._pid = pid
-        self._available = True
+        self._available = False
         self._events: List[dict] = []
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._ready_event: Optional[threading.Event] = None
         self._gpu_id = gpu_id
         self._stop_event = threading.Event()
+        self._handle = None
+        self._nvml_initialized = False
+
+        if pynvml is None:
+            return
 
         try:
             pynvml.nvmlInit()
+            self._nvml_initialized = True
             self._handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+            self._available = True
         except Exception as e:
             logger.error(f"Failed to initialize NVML: {e}")
-            self._available = False
+            # If nvmlInit succeeded but handle acquisition failed, cleanup
+            if self._nvml_initialized:
+                try:
+                    pynvml.nvmlShutdown()
+                    self._nvml_initialized = False
+                except Exception:
+                    pass
 
     def start(self) -> None:
         """Start the monitoring thread"""
@@ -158,14 +169,12 @@ class GPUStatsMonitor:
         self.stop()
 
     def __del__(self) -> None:
-        """Safely cleanup NVML resources"""
-        if not self._available or pynvml is None:
-            return
-
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
+        """Cleanup NVML resources if initialized"""
+        if self._nvml_initialized and pynvml is not None:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
 
 
 class TraceManager:
@@ -524,16 +533,17 @@ def trace_execution_time(name: Optional[str] = None) -> Callable:
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs) -> Any:
+            # Early exit if tracing is disabled
             if not envs.SGLANG_ENABLE_TRACE_EXECUTION_TIME.get():
+                return func(*args, **kwargs)
+
+            global _trace_manager
+            if _trace_manager is None or not _trace_manager.enable:
                 return func(*args, **kwargs)
 
             start_time = time.time()
             result = func(*args, **kwargs)
             end_time = time.time()
-
-            global _trace_manager
-            if _trace_manager is None or not _trace_manager.enable:
-                return result
 
             event = _create_trace_event(
                 cat=event_name,

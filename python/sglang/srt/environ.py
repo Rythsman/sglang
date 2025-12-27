@@ -348,6 +348,7 @@ class Envs:
 
     # Tracing
     SGLANG_ENABLE_TRACE_EXECUTION_TIME = EnvBool(True)
+    SGLANG_GPU_STATS_SAMPLE_INTERVAL_MS = EnvInt(500)
 
     # fmt: on
 
