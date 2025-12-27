@@ -346,6 +346,9 @@ class Envs:
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
 
+    # Tracing
+    SGLANG_ENABLE_TRACE_EXECUTION_TIME = EnvBool(True)
+
     # fmt: on
 
 

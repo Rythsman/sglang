@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 import psutil
 import torch
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -522,6 +524,9 @@ def trace_execution_time(name: Optional[str] = None) -> Callable:
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs) -> Any:
+            if not envs.SGLANG_ENABLE_TRACE_EXECUTION_TIME.get():
+                return func(*args, **kwargs)
+
             start_time = time.time()
             result = func(*args, **kwargs)
             end_time = time.time()
