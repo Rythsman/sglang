@@ -221,23 +221,34 @@ def _build_object_pivot_table(
     digits: int,
     include_iter_mean: bool,
 ) -> Tuple[List[str], List[List[str]]]:
-    """Build a pivot table (one row per object, columns per iter)."""
+    """Build a grouped table (one row per object).
+
+    Each score column is represented as a list of per-iter values:
+      [iter0_value, iter1_value, iter2_value, ...]
+    """
     headers: List[str] = ["object"]
-    for iter_tag in iters:
-        for col in SCORE_COLUMNS:
-            headers.append(f"{iter_tag}_{col}")
+    for col in SCORE_COLUMNS:
+        headers.append(col)
     if include_iter_mean:
         for col in SCORE_COLUMNS:
             headers.append(f"mean_{col}")
 
+    def _format_value(value: Optional[float]) -> str:
+        return _format_float(value, digits)
+
+    def _format_list(values: Sequence[Optional[float]]) -> str:
+        inner = ", ".join(_format_value(v) for v in values)
+        return f"[{inner}]"
+
     rows: List[List[str]] = []
     for obj in objects:
         row: List[str] = [obj]
-        for iter_tag in iters:
-            r = grouped.get(obj, {}).get(iter_tag)
-            for col in SCORE_COLUMNS:
-                value = r.averages.get(col) if r is not None else None
-                row.append(_format_float(value, digits))
+        for col in SCORE_COLUMNS:
+            per_iter_values: List[Optional[float]] = []
+            for iter_tag in iters:
+                r = grouped.get(obj, {}).get(iter_tag)
+                per_iter_values.append(r.averages.get(col) if r is not None else None)
+            row.append(_format_list(per_iter_values))
 
         if include_iter_mean:
             for col in SCORE_COLUMNS:
@@ -295,7 +306,7 @@ def main() -> None:
     parser.add_argument(
         "--group-by-object",
         action="store_true",
-        help="If set, pivot files with iter0/iter1/... in filename into one row per object",
+        help="If set, group files with iter0/iter1/... in filename into one row per object",
     )
     parser.add_argument(
         "--include-iter-mean",
