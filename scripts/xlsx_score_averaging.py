@@ -174,6 +174,9 @@ def _parse_object_iter_from_filename(file_name: str) -> Optional[ObjectIterKey]:
     the iter token and adjacent separators.
     """
     stem = os.path.splitext(os.path.basename(file_name))[0]
+    # Strip trailing timestamp suffix like "_20251230_194805" (or with '-' / '.').
+    # This is common when exporting results with a time marker appended.
+    stem = re.sub(r"([_\-.])\d{8}([_\-.])\d{6}$", "", stem)
     match = re.search(r"(?i)iter(\d+)", stem)
     if match is None:
         return None
