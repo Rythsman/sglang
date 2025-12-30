@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -42,6 +43,14 @@ class FileAverages:
     file_name: str
     averages: Dict[str, Optional[float]]
     counts: Dict[str, int]
+
+
+@dataclass(frozen=True)
+class ObjectIterKey:
+    """Parsed object name and iter tag from a filename."""
+
+    object_name: str
+    iter_tag: str
 
 
 def _iter_xlsx_files(input_dir: str) -> List[str]:
@@ -113,7 +122,12 @@ def compute_file_averages(
         )
 
     if only_evaluated and evaluated_column in df.columns:
-        mask = df[evaluated_column].astype(str).str.lower().isin(["true", "1", "yes", "y"])
+        mask = (
+            df[evaluated_column]
+            .astype(str)
+            .str.lower()
+            .isin(["true", "1", "yes", "y"])
+        )
         df = df.loc[mask]
 
     averages: Dict[str, Optional[float]] = {}
@@ -150,6 +164,95 @@ def _build_table_rows(results: Iterable[FileAverages], digits: int) -> List[List
             row.append(_format_float(r.averages.get(col), digits))
         rows.append(row)
     return rows
+
+
+def _parse_object_iter_from_filename(file_name: str) -> Optional[ObjectIterKey]:
+    """Parse object name and iter tag (iter0/iter1/...) from a file name.
+
+    The iter tag is detected by substring "iter<digits>" (case-insensitive).
+    The object name is the remaining part of the filename stem after removing
+    the iter token and adjacent separators.
+    """
+    stem = os.path.splitext(os.path.basename(file_name))[0]
+    match = re.search(r"(?i)iter(\d+)", stem)
+    if match is None:
+        return None
+
+    iter_tag = f"iter{match.group(1)}"
+    object_name = re.sub(r"(?i)([_\-.]?iter\d+[_\-.]?)", "_", stem)
+    object_name = object_name.strip("_-. ")
+    if not object_name:
+        object_name = stem
+    return ObjectIterKey(object_name=object_name, iter_tag=iter_tag)
+
+
+def _group_results_by_object_and_iter(
+    results: Sequence[FileAverages],
+) -> Tuple[Dict[str, Dict[str, FileAverages]], List[str], List[str]]:
+    """Group per-file results by object name and iter tag."""
+    grouped: Dict[str, Dict[str, FileAverages]] = {}
+    objects: List[str] = []
+    iters: List[str] = []
+
+    for r in results:
+        key = _parse_object_iter_from_filename(r.file_name)
+        if key is None:
+            continue
+        if key.object_name not in grouped:
+            grouped[key.object_name] = {}
+            objects.append(key.object_name)
+        grouped[key.object_name][key.iter_tag] = r
+        if key.iter_tag not in iters:
+            iters.append(key.iter_tag)
+
+    def _iter_sort_key(tag: str) -> Tuple[int, str]:
+        suffix = tag.replace("iter", "", 1)
+        return (int(suffix), tag) if suffix.isdigit() else (10**9, tag)
+
+    objects.sort()
+    iters.sort(key=_iter_sort_key)
+    return grouped, objects, iters
+
+
+def _build_object_pivot_table(
+    grouped: Dict[str, Dict[str, FileAverages]],
+    objects: Sequence[str],
+    iters: Sequence[str],
+    digits: int,
+    include_iter_mean: bool,
+) -> Tuple[List[str], List[List[str]]]:
+    """Build a pivot table (one row per object, columns per iter)."""
+    headers: List[str] = ["object"]
+    for iter_tag in iters:
+        for col in SCORE_COLUMNS:
+            headers.append(f"{iter_tag}_{col}")
+    if include_iter_mean:
+        for col in SCORE_COLUMNS:
+            headers.append(f"mean_{col}")
+
+    rows: List[List[str]] = []
+    for obj in objects:
+        row: List[str] = [obj]
+        for iter_tag in iters:
+            r = grouped.get(obj, {}).get(iter_tag)
+            for col in SCORE_COLUMNS:
+                value = r.averages.get(col) if r is not None else None
+                row.append(_format_float(value, digits))
+
+        if include_iter_mean:
+            for col in SCORE_COLUMNS:
+                values: List[float] = []
+                for iter_tag in iters:
+                    r = grouped.get(obj, {}).get(iter_tag)
+                    v = r.averages.get(col) if r is not None else None
+                    if v is not None:
+                        values.append(float(v))
+                mean_value = sum(values) / len(values) if values else None
+                row.append(_format_float(mean_value, digits))
+
+        rows.append(row)
+
+    return headers, rows
 
 
 def main() -> None:
@@ -189,6 +292,16 @@ def main() -> None:
         default="_evaluated",
         help="Column name used by --only-evaluated (default: _evaluated)",
     )
+    parser.add_argument(
+        "--group-by-object",
+        action="store_true",
+        help="If set, pivot files with iter0/iter1/... in filename into one row per object",
+    )
+    parser.add_argument(
+        "--include-iter-mean",
+        action="store_true",
+        help="When using --group-by-object, append mean columns across iters",
+    )
     args = parser.parse_args()
 
     input_dir = os.path.abspath(args.input_dir)
@@ -224,13 +337,30 @@ def main() -> None:
         except Exception as e:  # pylint: disable=broad-exception-caught
             errors.append((os.path.basename(xlsx_path), str(e)))
 
-    headers = ["file"] + list(SCORE_COLUMNS)
-    rows = _build_table_rows(results, digits=args.digits)
-    print(tabulate(rows, headers=headers, tablefmt="grid", stralign="left"))
+    if args.group_by_object:
+        grouped, objects, iters = _group_results_by_object_and_iter(results)
+        if not grouped:
+            raise SystemExit(
+                "No files matched iter pattern in filename. Expected '*iter0*.xlsx'."
+            )
+        headers, rows = _build_object_pivot_table(
+            grouped=grouped,
+            objects=objects,
+            iters=iters,
+            digits=args.digits,
+            include_iter_mean=args.include_iter_mean,
+        )
+        print(tabulate(rows, headers=headers, tablefmt="grid", stralign="left"))
+    else:
+        headers = ["file"] + list(SCORE_COLUMNS)
+        rows = _build_table_rows(results, digits=args.digits)
+        print(tabulate(rows, headers=headers, tablefmt="grid", stralign="left"))
 
     if errors:
         print("\nErrors:")
-        print(tabulate(errors, headers=["file", "error"], tablefmt="grid", stralign="left"))
+        print(
+            tabulate(errors, headers=["file", "error"], tablefmt="grid", stralign="left")
+        )
 
 
 if __name__ == "__main__":
