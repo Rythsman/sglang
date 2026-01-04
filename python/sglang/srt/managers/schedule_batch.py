@@ -39,6 +39,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
+import os
 import re
 import time
 from enum import Enum, auto
@@ -94,6 +95,25 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
 logger = logging.getLogger(__name__)
+
+def _mm_cuda_mem_debug_enabled() -> bool:
+    value = os.environ.get("SGLANG_MM_CUDA_MEM_DEBUG", "")
+    return value.lower() in ("1", "true", "yes", "y", "on")
+
+
+def _mm_cuda_mem_sync_enabled() -> bool:
+    value = os.environ.get("SGLANG_MM_CUDA_MEM_SYNC", "")
+    return value.lower() in ("1", "true", "yes", "y", "on")
+
+
+def _get_cuda_mem_stats() -> tuple[int, int, int, int]:
+    device = torch.cuda.current_device()
+    return (
+        torch.cuda.memory_allocated(device),
+        torch.cuda.memory_reserved(device),
+        torch.cuda.max_memory_allocated(device),
+        torch.cuda.max_memory_reserved(device),
+    )
 
 
 class BaseFinishReason:
@@ -1468,11 +1488,63 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for mm_item in mm_input.mm_items:
                 pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
+                    # Debug CUDA memory growth caused by moving pixel_values to GPU.
+                    if _mm_cuda_mem_debug_enabled() and torch.cuda.is_available():
+                        if _mm_cuda_mem_sync_enabled():
+                            torch.cuda.synchronize()
+                        before_alloc, before_res, before_peak_alloc, before_peak_res = (
+                            _get_cuda_mem_stats()
+                        )
+                        pv_bytes = pixel_values.numel() * pixel_values.element_size()
+                        pv_shape = tuple(pixel_values.shape)
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
+                    if _mm_cuda_mem_debug_enabled() and torch.cuda.is_available():
+                        if _mm_cuda_mem_sync_enabled():
+                            torch.cuda.synchronize()
+                        after_alloc, after_res, after_peak_alloc, after_peak_res = (
+                            _get_cuda_mem_stats()
+                        )
+                        logger.info(
+                            "mm_item.feature to(%s) shape=%s dtype=%s bytes=%d "
+                            "alloc=%d->%d (+%d) res=%d->%d (+%d) "
+                            "peak_alloc=%d->%d peak_res=%d->%d",
+                            str(self.device),
+                            pv_shape,
+                            str(pixel_values.dtype),
+                            pv_bytes,
+                            before_alloc,
+                            after_alloc,
+                            after_alloc - before_alloc,
+                            before_res,
+                            after_res,
+                            after_res - before_res,
+                            before_peak_alloc,
+                            after_peak_alloc,
+                            before_peak_res,
+                            after_peak_res,
+                        )
                 elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
+                    if _mm_cuda_mem_debug_enabled() and torch.cuda.is_available():
+                        if _mm_cuda_mem_sync_enabled():
+                            torch.cuda.synchronize()
+                        before_alloc, before_res, _, _ = _get_cuda_mem_stats()
                     mm_item.feature = pixel_values.reconstruct_on_target_device(
                         torch.cuda.current_device()
                     )
+                    if _mm_cuda_mem_debug_enabled() and torch.cuda.is_available():
+                        if _mm_cuda_mem_sync_enabled():
+                            torch.cuda.synchronize()
+                        after_alloc, after_res, _, _ = _get_cuda_mem_stats()
+                        logger.info(
+                            "mm_item.feature reconstruct_on_target_device alloc=%d->%d (+%d) "
+                            "res=%d->%d (+%d)",
+                            before_alloc,
+                            after_alloc,
+                            after_alloc - before_alloc,
+                            before_res,
+                            after_res,
+                            after_res - before_res,
+                        )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
