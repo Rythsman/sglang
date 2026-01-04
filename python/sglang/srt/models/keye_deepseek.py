@@ -1,3 +1,6 @@
+import gc
+import logging
+import os
 from collections.abc import Iterable
 from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple, Type, Union
@@ -40,6 +43,23 @@ from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _TP_RANK_DEFAULT = 0
 _TP_SIZE_DEFAULT = 1
+
+logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.lower() in ("1", "true", "yes", "y", "on")
+
+
+def _get_cuda_mem_stats() -> tuple[int, int, int, int]:
+    device = torch.cuda.current_device()
+    return (
+        torch.cuda.memory_allocated(device),
+        torch.cuda.memory_reserved(device),
+        torch.cuda.max_memory_allocated(device),
+        torch.cuda.max_memory_reserved(device),
+    )
 
 
 def _fixed_tp_kwargs() -> dict:
@@ -886,6 +906,18 @@ class KeyeVLMoeForConditionalGeneration(nn.Module):
         # TODO(wh): use decorator to refact
         # if self.mm_runtime_metrics is not None:
         #     start_time = time.time()
+        debug_mem = _env_flag("SGLANG_MM_VIDEO_FEATURE_DEBUG") and torch.cuda.is_available()
+        sync = _env_flag("SGLANG_MM_VIDEO_FEATURE_SYNC") and torch.cuda.is_available()
+        return_cpu_and_free = _env_flag("SGLANG_MM_VIDEO_FEATURE_RETURN_CPU_AND_FREE")
+        do_empty_cache = _env_flag("SGLANG_MM_VIDEO_FEATURE_EMPTY_CACHE")
+        do_gc = _env_flag("SGLANG_MM_VIDEO_FEATURE_GC")
+
+        if debug_mem:
+            if sync:
+                torch.cuda.synchronize()
+            before_alloc, before_res, before_peak_alloc, before_peak_res = (
+                _get_cuda_mem_stats()
+            )
 
         def split_thw(thw: torch.Tensor):
             if thw.dim() == 1:
@@ -942,6 +974,67 @@ class KeyeVLMoeForConditionalGeneration(nn.Module):
         #     self.mm_runtime_metrics.log_video(
         #         time.time() - start_time, video_embeds.shape[0]
         #     )
+        if debug_mem:
+            if sync:
+                torch.cuda.synchronize()
+            after_alloc, after_res, after_peak_alloc, after_peak_res = (
+                _get_cuda_mem_stats()
+            )
+            logger.info(
+                "get_video_feature output shape=%s dtype=%s "
+                "alloc=%d->%d (+%d) res=%d->%d (+%d) "
+                "peak_alloc=%d->%d peak_res=%d->%d",
+                tuple(video_embeds.shape),
+                str(video_embeds.dtype),
+                before_alloc,
+                after_alloc,
+                after_alloc - before_alloc,
+                before_res,
+                after_res,
+                after_res - before_res,
+                before_peak_alloc,
+                after_peak_alloc,
+                before_peak_res,
+                after_peak_res,
+            )
+
+        if return_cpu_and_free and video_embeds.is_cuda:
+            # Experimental: return CPU tensor and free GPU tensors immediately.
+            # This is ONLY for quick memory experiments and will likely break
+            # downstream GPU execution if enabled.
+            out = video_embeds.to("cpu", non_blocking=False)
+            del video_embeds
+            del pixel_values_videos
+            del video_grid_thw
+            del total_patches
+            del width
+            del cu_seqlens
+            del arange
+            del video_position_ids
+            del width_position_ids
+            del height_position_ids
+
+            if do_gc:
+                gc.collect()
+            if sync:
+                torch.cuda.synchronize()
+            if do_empty_cache:
+                torch.cuda.empty_cache()
+
+            if debug_mem:
+                if sync:
+                    torch.cuda.synchronize()
+                free_alloc, free_res, free_peak_alloc, free_peak_res = (
+                    _get_cuda_mem_stats()
+                )
+                logger.info(
+                    "get_video_feature after_free alloc=%d res=%d peak_alloc=%d peak_res=%d",
+                    free_alloc,
+                    free_res,
+                    free_peak_alloc,
+                    free_peak_res,
+                )
+            return out
 
         return video_embeds
 
