@@ -75,6 +75,35 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
+_weight_load_pin_memory = get_bool_env_var("SGLANG_WEIGHT_LOAD_PINNED")
+_weight_load_non_blocking = get_bool_env_var("SGLANG_WEIGHT_LOAD_NON_BLOCKING")
+# non_blocking H2D copy is only effective when the source is pinned.
+_weight_load_pin_memory = _weight_load_pin_memory or _weight_load_non_blocking
+
+
+def _maybe_pin_loaded_weight(t: torch.Tensor) -> torch.Tensor:
+    """Optionally pin CPU weights to speed up H2D copies.
+
+    Notes:
+    - This does NOT change numerics/precision (data is identical).
+    - It may increase transient host memory usage when enabled.
+    """
+    if not _weight_load_pin_memory:
+        return t
+    if t.device.type != "cpu":
+        return t
+    if t.is_pinned():
+        return t
+    if not t.is_contiguous():
+        t = t.contiguous()
+    return t.pin_memory()
+
+
+def _copy_weight(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Copy weights, optionally using pinned + non_blocking for H2D."""
+    src = _maybe_pin_loaded_weight(src)
+    dst.copy_(src, non_blocking=_weight_load_non_blocking)
+
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
@@ -332,7 +361,7 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
-            expert_data.copy_(loaded_weight)
+            _copy_weight(expert_data, loaded_weight)
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -400,7 +429,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
-        expert_data.copy_(loaded_weight)
+        _copy_weight(expert_data, loaded_weight)
 
     def _load_w2(
         self,
@@ -468,7 +497,7 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
-        expert_data.copy_(loaded_weight)
+        _copy_weight(expert_data, loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
@@ -496,7 +525,7 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             assert shard_id in ("w1", "w3")
-            expert_data.copy_(loaded_weight)
+            _copy_weight(expert_data, loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         num_global_routed_experts = self.num_experts - self.num_fused_shared_experts
@@ -532,11 +561,11 @@ class FusedMoE(torch.nn.Module):
         ):
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
+                _copy_weight(param.data[:, :dim1], loaded_weight)
             else:
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                _copy_weight(param.data[:, :dim1, :dim2], loaded_weight)
             return
 
         global_expert_location_metadata = get_global_expert_location_metadata()
@@ -671,7 +700,9 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight = loaded_weight * 2.0
 
             # this is needed for compressed-tensors only
-            loaded_weight = loaded_weight.to(param.data.device)
+            loaded_weight = _maybe_pin_loaded_weight(loaded_weight).to(
+                param.data.device, non_blocking=_weight_load_non_blocking
+            )
 
             if (
                 (
@@ -814,13 +845,13 @@ class FusedMoE(torch.nn.Module):
         ):
             if "bias" in weight_name:
                 dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
+                _copy_weight(param.data[:, :dim1], loaded_weight)
             elif "scale" in weight_name:
-                param.data.copy_(loaded_weight)
+                _copy_weight(param.data, loaded_weight)
             else:
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                _copy_weight(param.data[:, :dim1, :dim2], loaded_weight)
             return
 
         # compressed-tensors checkpoints with packed weights are stored flipped
