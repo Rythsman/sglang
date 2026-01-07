@@ -531,7 +531,12 @@ def _offload_mm_features_to_cpu(items: List[MultimodalDataItem]) -> None:
         if feat is None:
             continue
         if isinstance(feat, torch.Tensor) and feat.is_cuda:
-            item.feature = feat.detach().cpu()
+            # Use pinned host memory + non_blocking copy for faster D2H offload.
+            # This schedules an async copy on the current CUDA stream.
+            feat_detached = feat.detach()
+            cpu_buf = torch.empty_like(feat_detached, device="cpu", pin_memory=True)
+            cpu_buf.copy_(feat_detached, non_blocking=True)
+            item.feature = cpu_buf
 
 
 def embed_mm_inputs(
