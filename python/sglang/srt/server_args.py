@@ -530,6 +530,7 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
+    mm_offload_feature_after_embed: bool = False
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
@@ -3653,6 +3654,16 @@ class ServerArgs:
             "--keep-mm-feature-on-device",
             action="store_true",
             help="Keep multimodal feature tensors on device after processing to save D2H copy.",
+        )
+        parser.add_argument(
+            "--mm-offload-feature-after-embed",
+            action="store_true",
+            default=ServerArgs.mm_offload_feature_after_embed,
+            help=(
+                "Offload multimodal feature tensors from device to CPU after multimodal embeddings "
+                "are computed. This frees GPU memory but may add D2H/H2D copy overhead on cache miss. "
+                "Uses pinned host memory + non_blocking copy."
+            ),
         )
         parser.add_argument(
             "--enable-return-hidden-states",
