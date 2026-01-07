@@ -513,6 +513,27 @@ def get_embedding_and_mask(
     return embedding, special_multimodal_mask
 
 
+def _offload_mm_features_to_cpu(items: List[MultimodalDataItem]) -> None:
+    """Offload raw multimodal features from GPU to CPU to free VRAM.
+
+    Notes:
+        - Only offload when `item.hash` is already set. Recomputing `hash/pad_value`
+          after moving tensors across devices can cause inconsistent hashes.
+        - Keep features on CPU (not None) so we can recompute embeddings on cache miss
+          (e.g. LRU eviction / retract / chunked prefill retry).
+    """
+    if not items:
+        return
+    for item in items:
+        if item is None or item.hash is None:
+            continue
+        feat = getattr(item, "feature", None)
+        if feat is None:
+            continue
+        if isinstance(feat, torch.Tensor) and feat.is_cuda:
+            item.feature = feat.detach().cpu()
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -599,6 +620,8 @@ def embed_mm_inputs(
                 extend_length=extend_seq_lens,
                 items_offset_list=items_offsets,
             )
+            # Free GPU VRAM for raw features after embeddings are computed for this modality.
+            _offload_mm_features_to_cpu(items)
 
             if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (
