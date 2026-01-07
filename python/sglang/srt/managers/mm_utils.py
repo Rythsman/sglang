@@ -522,6 +522,8 @@ def _offload_mm_features_to_cpu(items: List[MultimodalDataItem]) -> None:
         - Keep features on CPU (not None) so we can recompute embeddings on cache miss
           (e.g. LRU eviction / retract / chunked prefill retry).
     """
+    if not get_global_server_args().mm_offload_feature_after_embed:
+        return
     if not items:
         return
     for item in items:
