@@ -1468,6 +1468,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for mm_item in mm_input.mm_items:
                 pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
+                    # Preserve the original CPU feature tensor (if any) before H2D.
+                    # This allows later VRAM offload to restore the CPU tensor without doing D2H.
+                    if not pixel_values.is_cuda and mm_item.model_specific_data.get(
+                        "_sgl_feature_cpu"
+                    ) is None:
+                        mm_item.model_specific_data["_sgl_feature_cpu"] = pixel_values
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
                 elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
                     mm_item.feature = pixel_values.reconstruct_on_target_device(

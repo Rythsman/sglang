@@ -533,7 +533,17 @@ def _offload_mm_features_to_cpu(items: List[MultimodalDataItem]) -> None:
         if feat is None:
             continue
         if isinstance(feat, torch.Tensor) and feat.is_cuda:
-            # Use pinned host memory + non_blocking copy for faster D2H offload.
+            # Prefer restoring the preserved CPU tensor (if available) to avoid D2H copy.
+            cpu_feat = None
+            try:
+                cpu_feat = item.model_specific_data.get("_sgl_feature_cpu")
+            except Exception:
+                cpu_feat = None
+            if isinstance(cpu_feat, torch.Tensor) and not cpu_feat.is_cuda:
+                item.feature = cpu_feat
+                continue
+
+            # Fallback: use pinned host memory + non_blocking copy for faster D2H offload.
             # This schedules an async copy on the current CUDA stream.
             feat_detached = feat.detach()
             cpu_buf = torch.empty_like(feat_detached, device="cpu", pin_memory=True)
