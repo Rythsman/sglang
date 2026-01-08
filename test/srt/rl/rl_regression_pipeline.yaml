@@ -1,0 +1,27 @@
+name: rl-regression
+version: 1
+
+defaults:
+  timeout_s: 1800
+  continue_on_error: false
+  pythonpath:
+    - python
+    - test
+
+steps:
+  - name: dump-weights-api
+    file: test/srt/test_dump_weights_api.py
+    timeout_s: 7200
+
+  - name: post-load-weights-from-tensor-api
+    file: test/srt/test_post_load_weights_from_tensor_api.py
+    timeout_s: 1800
+
+  - name: release-memory-occupation
+    file: test/srt/test_release_memory_occupation.py
+    timeout_s: 3600
+
+  - name: update-weights-from-tensor
+    file: test/srt/rl/test_update_weights_from_tensor.py
+    timeout_s: 3600
+
