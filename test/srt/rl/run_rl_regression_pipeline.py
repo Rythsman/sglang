@@ -127,6 +127,13 @@ def _run_python_file(path: str, timeout_s: int, env: Dict[str, str]) -> int:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Test file not found: {path}")
 
+    def _killpg(pid: int, sig: int):
+        """Send a signal to the process group (best-effort)."""
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            return
+
     proc = subprocess.Popen(
         ["python3", path],
         stdout=None,
@@ -135,33 +142,19 @@ def _run_python_file(path: str, timeout_s: int, env: Dict[str, str]) -> int:
         start_new_session=True,  # Create a new process group on Linux.
     )
     try:
-        try:
-            proc.wait(timeout=timeout_s)
-            return int(proc.returncode or 0)
-        except KeyboardInterrupt:
-            # Ctrl+C hits the runner, but child is in a new process group,
-            # so we must forward termination explicitly.
-            try:
-                os.killpg(proc.pid, signal.SIGINT)
-            except ProcessLookupError:
-                pass
-            time.sleep(0.2)
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            raise
+        proc.wait(timeout=timeout_s)
+        return int(proc.returncode or 0)
+    except KeyboardInterrupt:
+        # Forward Ctrl+C to the child process group.
+        _killpg(proc.pid, signal.SIGINT)
+        raise
     except subprocess.TimeoutExpired:
+        # Timeout: try a graceful stop first, then force-kill.
+        _killpg(proc.pid, signal.SIGTERM)
         try:
-            # Try a graceful stop first.
-            os.killpg(proc.pid, signal.SIGTERM)
             proc.wait(timeout=10)
-        except Exception:  # pylint: disable=broad-exception-caught
-            pass
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        except subprocess.TimeoutExpired:
+            _killpg(proc.pid, signal.SIGKILL)
         return 124
 
 
