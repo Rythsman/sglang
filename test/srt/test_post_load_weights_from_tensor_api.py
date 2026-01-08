@@ -18,6 +18,12 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 _PYTHON_DIR = os.path.join(_REPO_ROOT, "python")
 if _PYTHON_DIR not in sys.path:
     sys.path.insert(0, _PYTHON_DIR)
+if _REPO_ROOT not in sys.path:
+    # Make `test.*` importable for external model registration.
+    sys.path.insert(0, _REPO_ROOT)
+
+# Register the test-only fake model package before importing sglang.
+os.environ.setdefault("SGLANG_EXTERNAL_MODEL_PACKAGE", "test.srt.debug_utils")
 
 
 def _assert_success(testcase: unittest.TestCase, ret):

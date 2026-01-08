@@ -1,8 +1,6 @@
 """A tiny Transformers-backend model for testing post_load_weights APIs.
 
-This model is intentionally minimal and relies on `TransformersForCausalLM`
-to satisfy SGLang runtime expectations, while adding a lightweight
-`post_load_weights()` hook for API testing.
+This model is test-only and is registered via SGLANG_EXTERNAL_MODEL_PACKAGE.
 """
 
 from __future__ import annotations
