@@ -6,7 +6,7 @@ defaults:
   continue_on_error: false
   pythonpath:
     - python
-    - test
+    - .
 
 steps:
   - name: dump-weights-api
