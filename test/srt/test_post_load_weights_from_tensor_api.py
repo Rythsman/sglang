@@ -22,6 +22,14 @@ if _REPO_ROOT not in sys.path:
     # Make `test.*` importable for external model registration.
     sys.path.insert(0, _REPO_ROOT)
 
+# Avoid importing the stdlib `test` package by accident.
+# If stdlib `test` is already imported, importing `test.srt...` will not fallback.
+if "test" in sys.modules:
+    test_mod = sys.modules["test"]
+    test_file = getattr(test_mod, "__file__", "") or ""
+    if test_file and os.path.abspath(test_file).startswith(os.path.abspath(sys.base_prefix)):
+        del sys.modules["test"]
+
 # Register the test-only fake model package before importing sglang.
 os.environ.setdefault("SGLANG_EXTERNAL_MODEL_PACKAGE", "test.srt.debug_utils")
 
