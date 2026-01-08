@@ -13,6 +13,7 @@ Design goals:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+_TEST_UTILS_OVERRIDES_ENV = "SGLANG_TEST_UTILS_OVERRIDES_JSON"
 
 
 @dataclass(frozen=True)
@@ -158,6 +160,79 @@ def _run_python_file(path: str, timeout_s: int, env: Dict[str, str]) -> int:
         return 124
 
 
+def _run_python_file_with_test_utils_overrides(
+    path: str, timeout_s: int, env: Dict[str, str]
+) -> int:
+    """Run a test file after patching `sglang.test.test_utils` constants.
+
+    This allows overriding DEFAULT_* model paths in existing tests without
+    modifying the test files themselves.
+    """
+    overrides_raw = (env.get(_TEST_UTILS_OVERRIDES_ENV, "") or "").strip()
+    if not overrides_raw:
+        return _run_python_file(path, timeout_s=timeout_s, env=env)
+
+    # Validate JSON early to fail fast.
+    try:
+        overrides = json.loads(overrides_raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"{_TEST_UTILS_OVERRIDES_ENV} must be valid JSON object, got: {overrides_raw}"
+        ) from e
+    if not isinstance(overrides, dict):
+        raise ValueError(f"{_TEST_UTILS_OVERRIDES_ENV} must be a JSON object.")
+
+    # Use a small wrapper so patched values are imported by `from ... import ...`.
+    wrapper = r"""
+import json
+import os
+import runpy
+import sys
+
+import sglang.test.test_utils as tu
+
+raw = os.environ.get("SGLANG_TEST_UTILS_OVERRIDES_JSON", "") or ""
+overrides = json.loads(raw) if raw else {}
+if not isinstance(overrides, dict):
+    raise TypeError("SGLANG_TEST_UTILS_OVERRIDES_JSON must be a JSON object")
+
+for k, v in overrides.items():
+    if not isinstance(k, str):
+        continue
+    if hasattr(tu, k):
+        setattr(tu, k, "" if v is None else str(v))
+
+runpy.run_path(sys.argv[1], run_name="__main__")
+"""
+
+    def _killpg(pid: int, sig: int):
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            return
+
+    proc = subprocess.Popen(
+        ["python3", "-c", wrapper, path],
+        stdout=None,
+        stderr=None,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        proc.wait(timeout=timeout_s)
+        return int(proc.returncode or 0)
+    except KeyboardInterrupt:
+        _killpg(proc.pid, signal.SIGINT)
+        raise
+    except subprocess.TimeoutExpired:
+        _killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _killpg(proc.pid, signal.SIGKILL)
+        return 124
+
+
 def _run_step(step: Step, repo_root: Path) -> int:
     print(f"\n=== Running step: {step.name} ===", flush=True)
     print(f"file={step.file}", flush=True)
@@ -169,7 +244,9 @@ def _run_step(step: Step, repo_root: Path) -> int:
     abs_path = str((repo_root / step.file).resolve())
     start = time.perf_counter()
     try:
-        code = _run_python_file(abs_path, timeout_s=step.timeout_s, env=env)
+        code = _run_python_file_with_test_utils_overrides(
+            abs_path, timeout_s=step.timeout_s, env=env
+        )
     except Exception as e:  # pylint: disable=broad-exception-caught
         print(f"exception={e}", flush=True)
         code = 1
