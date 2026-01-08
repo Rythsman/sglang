@@ -7,7 +7,7 @@ This runner is intentionally lightweight:
 
 Design goals:
 - KISS: minimal behavior, minimal schema.
-- Reuse: reuse SGLang's existing test runner utilities.
+- Reuse: reuse SGLang's existing "python3 <test_file>" execution style.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import os
 import signal
-import sys
 import subprocess
 import time
 from dataclasses import dataclass
@@ -23,9 +22,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_PYTHON_DIR = _REPO_ROOT / "python"
-if str(_PYTHON_DIR) not in sys.path:
-    sys.path.insert(0, str(_PYTHON_DIR))
 
 
 @dataclass(frozen=True)
@@ -128,6 +124,9 @@ def _prepend_pythonpath(repo_root: Path, extra_entries: Sequence[str]):
 
 def _run_python_file(path: str, timeout_s: int, env: Dict[str, str]) -> int:
     """Run `python3 <path>` with a timeout and return exit code."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Test file not found: {path}")
+
     proc = subprocess.Popen(
         ["python3", path],
         stdout=None,
@@ -140,13 +139,19 @@ def _run_python_file(path: str, timeout_s: int, env: Dict[str, str]) -> int:
         return int(proc.returncode or 0)
     except subprocess.TimeoutExpired:
         try:
+            # Try a graceful stop first.
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=10)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         return 124
 
 
-def _run_step(step: Step, repo_root: Path, continue_on_error: bool) -> int:
+def _run_step(step: Step, repo_root: Path) -> int:
     print(f"\n=== Running step: {step.name} ===", flush=True)
     print(f"file={step.file}", flush=True)
     print(f"timeout_s={step.timeout_s}", flush=True)
@@ -156,7 +161,11 @@ def _run_step(step: Step, repo_root: Path, continue_on_error: bool) -> int:
 
     abs_path = str((repo_root / step.file).resolve())
     start = time.perf_counter()
-    code = _run_python_file(abs_path, timeout_s=step.timeout_s, env=env)
+    try:
+        code = _run_python_file(abs_path, timeout_s=step.timeout_s, env=env)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"exception={e}", flush=True)
+        code = 1
     elapsed = time.perf_counter() - start
     print(f"exit_code={code} elapsed_s={elapsed:.1f}", flush=True)
     return 0 if code == 0 else 1
@@ -191,12 +200,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"Steps: {[s.name for s in pipeline.steps]}", flush=True)
 
     any_failed = False
+    passed_steps: List[str] = []
+    failed_steps: List[str] = []
     for step in pipeline.steps:
-        ret = _run_step(step, repo_root=repo_root, continue_on_error=args.continue_on_error or pipeline.continue_on_error)
+        ret = _run_step(step, repo_root=repo_root)
         if ret != 0:
             any_failed = True
+            failed_steps.append(step.name)
             if not (args.continue_on_error or pipeline.continue_on_error):
                 break
+        else:
+            passed_steps.append(step.name)
+
+    print("\n" + "=" * 60, flush=True)
+    print(f"Summary: {len(passed_steps)}/{len(pipeline.steps)} passed", flush=True)
+    if passed_steps:
+        print(f"PASSED: {passed_steps}", flush=True)
+    if failed_steps:
+        print(f"FAILED: {failed_steps}", flush=True)
+    print("=" * 60, flush=True)
 
     return 1 if any_failed else 0
 
