@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
+_ACTIVE_PROC: Optional[subprocess.Popen] = None
+
 
 @dataclass(frozen=True)
 class Step:
@@ -127,6 +129,7 @@ def _run_python_file(path: str, timeout_s: int, env: Dict[str, str]) -> int:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Test file not found: {path}")
 
+    global _ACTIVE_PROC  # pylint: disable=global-statement
     proc = subprocess.Popen(
         ["python3", path],
         stdout=None,
@@ -134,6 +137,7 @@ def _run_python_file(path: str, timeout_s: int, env: Dict[str, str]) -> int:
         env=env,
         start_new_session=True,  # Create a new process group on Linux.
     )
+    _ACTIVE_PROC = proc
     try:
         proc.wait(timeout=timeout_s)
         return int(proc.returncode or 0)
@@ -149,6 +153,48 @@ def _run_python_file(path: str, timeout_s: int, env: Dict[str, str]) -> int:
         except ProcessLookupError:
             pass
         return 124
+    finally:
+        _ACTIVE_PROC = None
+
+
+def _terminate_active_process_group(sig: int):
+    """Best-effort terminate the currently running step process group."""
+    proc = _ACTIVE_PROC
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        return
+
+
+def _install_signal_handlers():
+    """Ensure Ctrl+C stops the whole pipeline immediately.
+
+    Note: child processes are started in a new session/process-group, so we need to
+    explicitly forward signals to them.
+    """
+
+    def _handle_sigint(_signum, _frame):
+        # Forward SIGINT to the active step first.
+        _terminate_active_process_group(signal.SIGINT)
+        # Escalate quickly in case the child ignores SIGINT.
+        time.sleep(0.2)
+        _terminate_active_process_group(signal.SIGTERM)
+        time.sleep(0.5)
+        _terminate_active_process_group(signal.SIGKILL)
+        raise SystemExit(130)
+
+    def _handle_sigterm(_signum, _frame):
+        _terminate_active_process_group(signal.SIGTERM)
+        time.sleep(0.5)
+        _terminate_active_process_group(signal.SIGKILL)
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
 def _run_step(step: Step, repo_root: Path) -> int:
@@ -192,6 +238,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     data = _load_yaml(args.config)
     pipeline = _parse_pipeline(data)
+
+    _install_signal_handlers()
 
     # Ensure local imports work when running from source.
     _prepend_pythonpath(repo_root, pipeline.pythonpath)
