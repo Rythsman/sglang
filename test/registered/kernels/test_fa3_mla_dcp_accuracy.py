@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import unittest
 from typing import List, Tuple
 
 try:
@@ -15,12 +14,14 @@ from sglang.test.test_utils import CustomTestCase
 def _compute_sm_scale() -> float:
     """Match the scale formula used by existing MLA benchmarks."""
     x = 0.1 * math.log(40.0) + 1.0
-    return x * x * ((128.0 + 64.0) ** -0.5)
+    return x * x * ((512.0 + 64.0) ** -0.5)
 
 
 def _maybe_import_fa3_kernel():
     try:
-        from sgl_kernel.flash_attn import flash_attn_with_kvcache  # pylint: disable=import-outside-toplevel
+        from sgl_kernel.flash_attn import (
+            flash_attn_with_kvcache,  # pylint: disable=import-outside-toplevel
+        )
 
         return flash_attn_with_kvcache
     except Exception:  # noqa: BLE001
@@ -39,9 +40,7 @@ def _build_dcp_local_lens_and_indices(
     for original_len_i, local_len_i in zip(kv_lens_cpu.tolist(), local_lens.tolist()):
         if local_len_i > 0:
             idx = (
-                torch.arange(local_len_i, dtype=torch.int64) * dcp_size
-                + rank
-                + offset
+                torch.arange(local_len_i, dtype=torch.int64) * dcp_size + rank + offset
             )
         else:
             idx = torch.empty((0,), dtype=torch.int64)
@@ -77,12 +76,12 @@ class TestFA3MLADcpAccuracy(CustomTestCase):
         torch.cuda.manual_seed(0)
 
         # Keep this test small for CI.
-        batch_size = 2
-        seq_len = 512
-        tp_size = 16
-        dcp_size = 4
-        head_dim_ckv = 64
-        head_dim_kpe = 32
+        batch_size = 1
+        seq_len = 8192
+        tp_size = 32
+        dcp_size = 8
+        head_dim_ckv = 512
+        head_dim_kpe = 64
         page_size = 1
 
         # Initial bring-up scope: bf16 only.
@@ -95,7 +94,9 @@ class TestFA3MLADcpAccuracy(CustomTestCase):
         q_nope = torch.randn(
             (batch_size, num_heads, head_dim_ckv), device=device, dtype=dtype
         )
-        q_pe = torch.randn((batch_size, num_heads, head_dim_kpe), device=device, dtype=dtype)
+        q_pe = torch.randn(
+            (batch_size, num_heads, head_dim_kpe), device=device, dtype=dtype
+        )
 
         kv_all = torch.randn(
             (batch_size * seq_len, 1, head_dim_ckv + head_dim_kpe),
@@ -108,7 +109,9 @@ class TestFA3MLADcpAccuracy(CustomTestCase):
         # page_table indexes tokens when page_size == 1.
         page_table_global = torch.stack(
             [
-                torch.arange(b * seq_len, (b + 1) * seq_len, device=device, dtype=torch.int32)
+                torch.arange(
+                    b * seq_len, (b + 1) * seq_len, device=device, dtype=torch.int32
+                )
                 for b in range(batch_size)
             ],
             dim=0,
@@ -140,7 +143,9 @@ class TestFA3MLADcpAccuracy(CustomTestCase):
         torch.cuda.synchronize()
 
         # DCP simulation: rank-local attention + LSE merge.
-        kv_lens_cpu = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cpu")
+        kv_lens_cpu = torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device="cpu"
+        )
         outs: List[torch.Tensor] = []
         lses: List[torch.Tensor] = []
 
@@ -148,6 +153,7 @@ class TestFA3MLADcpAccuracy(CustomTestCase):
             per_seq_indices, local_lens_cpu = _build_dcp_local_lens_and_indices(
                 kv_lens_cpu, dcp_size, rank
             )
+            # print(f"{rank=}, {per_seq_indices=}, {local_lens_cpu=}", flush=True)
             local_lens = local_lens_cpu.to(device=device, non_blocking=True)
             max_local = int(local_lens_cpu.max().item())
 
@@ -212,5 +218,4 @@ class TestFA3MLADcpAccuracy(CustomTestCase):
         diff = (o_merged - o_base).float()
         max_abs = diff.abs().max().item()
         mean_abs = diff.abs().mean().item()
-        self.assertLess(max_abs, 5e-2, msg=f"{max_abs=}, {mean_abs=}")
-
+        self.assertLess(max_abs, 1e-3, msg=f"{max_abs=}, {mean_abs=}")
