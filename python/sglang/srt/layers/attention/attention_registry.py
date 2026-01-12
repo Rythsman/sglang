@@ -133,6 +133,23 @@ def create_flashattention_v3_backend(runner):
         "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
         "Please use `--attention-backend flashinfer`."
     )
+    if runner.use_mla_backend:
+        # DCP bring-up for MLA only targets bf16 decode compute.
+        # For non-DCP MLA, reuse the existing FA backend implementation.
+        try:
+            from sglang.srt.distributed import get_dcp_world_size
+
+            dcp_world_size = get_dcp_world_size()
+        except Exception:
+            dcp_world_size = 1
+
+        if dcp_world_size > 1:
+            from sglang.srt.layers.attention.flashattention_mla_dcp_backend import (
+                FlashAttentionMLADcpBackend,
+            )
+
+            return FlashAttentionMLADcpBackend(runner)
+
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
     return FlashAttentionBackend(runner)
