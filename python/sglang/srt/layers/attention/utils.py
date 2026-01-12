@@ -183,6 +183,61 @@ def concat_and_cast_mha_k_triton(
     )
 
 
+def compute_dcp_local_seq_lens(
+    seq_lens: torch.Tensor, dcp_rank: int, dcp_world_size: int
+) -> torch.Tensor:
+    """Compute per-sequence local lengths under DCP token sharding.
+
+    The formula matches the one used in FlashInfer MLA DCP decode:
+        local_len = ((len - rank - 1) // world_size) + 1
+
+    Args:
+        seq_lens: Shape [B], integer tensor on any device.
+        dcp_rank: Rank in [0, dcp_world_size).
+        dcp_world_size: DCP world size.
+
+    Returns:
+        Shape [B] int32 tensor on the same device as seq_lens.
+    """
+    if dcp_world_size <= 0:
+        raise ValueError(f"Expected dcp_world_size > 0, got {dcp_world_size}")
+    if dcp_rank < 0 or dcp_rank >= dcp_world_size:
+        raise ValueError(
+            f"Expected 0 <= dcp_rank < dcp_world_size, got {dcp_rank=} {dcp_world_size=}"
+        )
+    if seq_lens.numel() == 0:
+        return seq_lens.to(torch.int32)
+
+    lens_i64 = seq_lens.to(torch.int64)
+    local = ((lens_i64 - dcp_rank - 1) // dcp_world_size) + 1
+    local = torch.clamp(local, min=0).to(torch.int32)
+    return local
+
+
+def filter_and_localize_token_indices(
+    token_indices: torch.Tensor, dcp_rank: int, dcp_world_size: int
+) -> torch.Tensor:
+    """Filter token indices for one DCP rank and map to local index space.
+
+    This follows the semantics used by DCP KV cache layout:
+      - keep indices where (idx % world_size) == rank
+      - map to local index with idx // world_size
+
+    Args:
+        token_indices: 1D integer tensor on CUDA/CPU.
+        dcp_rank: DCP rank.
+        dcp_world_size: DCP world size.
+
+    Returns:
+        1D int32 tensor on the same device as token_indices.
+    """
+    if dcp_world_size <= 0:
+        raise ValueError(f"Expected dcp_world_size > 0, got {dcp_world_size}")
+    mask = (token_indices.to(torch.int64) % dcp_world_size) == dcp_rank
+    filtered = token_indices[mask].to(torch.int64) // dcp_world_size
+    return filtered.to(torch.int32)
+
+
 @triton.jit
 def pad_sequence_with_mask_kernel(
     input_ptr,  # (total_tokens, hidden)
