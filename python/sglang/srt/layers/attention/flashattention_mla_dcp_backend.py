@@ -7,7 +7,10 @@ import torch
 from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.utils import compute_dcp_local_seq_lens
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
 
 class FlashAttentionMLADcpBackend(FlashAttentionBackend):
@@ -56,6 +59,127 @@ class FlashAttentionMLADcpBackend(FlashAttentionBackend):
             not self.has_local_attention
         ), "Local attention is not supported for DCP+MLA FA3 yet."
         assert not self.has_swa, "SWA is not supported for DCP+MLA FA3 yet."
+
+        # CUDA-graph buffers (allocated in init_cuda_graph_state).
+        self._dcp_cuda_pos_indices: Optional[torch.Tensor] = None
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        """Allocate CUDA graph buffers for DCP+MLA decode.
+
+        We reuse FlashAttentionBackend's CUDA graph infrastructure, but keep a
+        separate set of metadata buffers for the DCP-local view:
+          - local cache_seqlens_int32
+          - local cu_seqlens_k
+          - local page_table (already localized to this DCP rank)
+
+        Note: this backend only supports page_size=1 currently.
+        """
+        super().init_cuda_graph_state(max_bs, max_num_tokens)
+
+        max_local_k = (self.max_context_len + self._dcp_world_size - 1) // self._dcp_world_size
+        self.decode_cuda_graph_metadata["dcp_cache_seqlens"] = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+        self.decode_cuda_graph_metadata["dcp_cu_seqlens_q"] = torch.arange(
+            0, max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        self.decode_cuda_graph_metadata["dcp_cu_seqlens_k"] = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        self.decode_cuda_graph_metadata["dcp_page_table"] = torch.zeros(
+            max_bs, max_local_k, dtype=torch.int32, device=self.device
+        )
+
+        # Positions in a sequence that belong to this DCP rank under token sharding.
+        # We clip to keep gather indices in-bounds; extra columns are ignored via cache_seqlens.
+        pos = (
+            torch.arange(max_local_k, device=self.device, dtype=torch.int64)
+            * self._dcp_world_size
+            + self._dcp_rank
+        )
+        pos.clamp_(max=self.max_context_len - 1)
+        self._dcp_cuda_pos_indices = pos
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info,
+    ):
+        # Decode-only, no spec/verify for initial bring-up.
+        assert forward_mode.is_decode_or_idle(), "Only decode is supported for DCP+MLA FA3."
+        assert spec_info is None, "Speculative decoding is not supported for DCP+MLA FA3 yet."
+        assert encoder_lens is None, "Cross attention is not supported for DCP+MLA FA3 yet."
+
+        # The base class uses FlashAttentionMetadata; import locally to avoid circular.
+        from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+
+        metadata = FlashAttentionMetadata()
+        # Use pre-allocated CUDA-graph buffers.
+        metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata["dcp_cache_seqlens"][:bs]
+        metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["dcp_cu_seqlens_q"][: bs + 1]
+        metadata.cu_seqlens_k = self.decode_cuda_graph_metadata["dcp_cu_seqlens_k"][: bs + 1]
+        metadata.page_table = self.decode_cuda_graph_metadata["dcp_page_table"][:bs, :]
+        metadata.max_seq_len_q = 1
+
+        # Keep max_seq_len_k consistent with the captured placeholder seq_lens.
+        local_lens = compute_dcp_local_seq_lens(seq_lens[:bs], self._dcp_rank, self._dcp_world_size)
+        metadata.cache_seqlens_int32.copy_(local_lens)
+        metadata.max_seq_len_k = int(local_lens.max().item()) if bs > 0 else 0
+        metadata.cu_seqlens_k[1:].copy_(
+            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+        )
+
+        # Pre-fill page_table for capture. Values will be overwritten in replay.
+        max_local = metadata.page_table.shape[1]
+        assert self._dcp_cuda_pos_indices is not None
+        cols = self._dcp_cuda_pos_indices[:max_local]
+        gathered = self.req_to_token[req_pool_indices[:bs, None], cols[None, :]]
+        metadata.page_table.copy_((gathered // self._dcp_world_size).to(torch.int32))
+
+        self.decode_cuda_graph_metadata[bs] = metadata
+        self.forward_metadata = metadata
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info,
+        seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
+    ):
+        # Decode-only, no spec/verify for initial bring-up.
+        assert forward_mode.is_decode_or_idle(), "Only decode is supported for DCP+MLA FA3."
+        assert spec_info is None, "Speculative decoding is not supported for DCP+MLA FA3 yet."
+        assert encoder_lens is None, "Cross attention is not supported for DCP+MLA FA3 yet."
+
+        req_pool_indices = req_pool_indices[:bs]
+        seq_lens = seq_lens[:bs]
+
+        metadata = self.decode_cuda_graph_metadata[bs]
+        assert self._dcp_cuda_pos_indices is not None
+
+        local_lens = compute_dcp_local_seq_lens(seq_lens, self._dcp_rank, self._dcp_world_size)
+        metadata.cache_seqlens_int32.copy_(local_lens)
+        metadata.max_seq_len_k = int(local_lens.max().item()) if bs > 0 else 0
+        metadata.cu_seqlens_k[1:].copy_(
+            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+        )
+
+        max_local = metadata.page_table.shape[1]
+        cols = self._dcp_cuda_pos_indices[:max_local]
+        gathered = self.req_to_token[req_pool_indices[:, None], cols[None, :]]
+        metadata.page_table.copy_((gathered // self._dcp_world_size).to(torch.int32))
+
+        self.forward_metadata = metadata
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Decode-only for the first stage.
@@ -191,8 +315,6 @@ class FlashAttentionMLADcpBackend(FlashAttentionBackend):
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
-
-        from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
         result = flash_attn_with_kvcache(
             q=q_rope,
