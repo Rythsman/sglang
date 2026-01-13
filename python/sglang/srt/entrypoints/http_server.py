@@ -201,21 +201,59 @@ async def init_multi_tokenizer() -> ServerArgs:
     return server_args
 
 
+async def _resolve_lifespan_init_args(
+    fast_api_app: FastAPI,
+) -> tuple[
+    ServerArgs,
+    tuple[
+        ServerArgs,
+        Optional[multiprocessing.connection.Connection],
+        Optional[Callable[[], None]],
+    ],
+    str,
+]:
+    """Resolve server args and warmup thread args for FastAPI lifespan.
+
+    Notes:
+        Some integrations may construct/reuse their own FastAPI object and only
+        set a subset of attributes expected by this module. This helper provides
+        a defensive, compatibility-oriented resolution.
+    """
+    if getattr(fast_api_app, "is_single_tokenizer_mode", False):
+        server_args = getattr(fast_api_app, "server_args", None)
+        if server_args is None:
+            raise RuntimeError(
+                "FastAPI app is marked as single-tokenizer mode but missing "
+                "`server_args`. Please launch via `launch_server()` or set "
+                "`app.server_args` explicitly."
+            )
+
+        warmup_thread_args = getattr(fast_api_app, "warmup_thread_args", None)
+        if warmup_thread_args is None:
+            warmup_thread_args = (
+                server_args,
+                None,
+                None,
+            )
+        thread_label = "Tokenizer"
+        return server_args, warmup_thread_args, thread_label
+
+    # Initialize multi-tokenizer support for worker processes
+    server_args = await init_multi_tokenizer()
+    warmup_thread_args = (
+        server_args,
+        None,
+        None,
+    )
+    thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
+    return server_args, warmup_thread_args, thread_label
+
+
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    if getattr(fast_api_app, "is_single_tokenizer_mode", False):
-        server_args = fast_api_app.server_args
-        warmup_thread_args = fast_api_app.warmup_thread_args
-        thread_label = "Tokenizer"
-    else:
-        # Initialize multi-tokenizer support for worker processes
-        server_args = await init_multi_tokenizer()
-        warmup_thread_args = (
-            server_args,
-            None,
-            None,
-        )
-        thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
+    server_args, warmup_thread_args, thread_label = await _resolve_lifespan_init_args(
+        fast_api_app
+    )
 
     # Add prometheus middleware
     if server_args.enable_metrics:
