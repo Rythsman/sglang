@@ -370,8 +370,28 @@ def _read_video_decord(
 
     final_nframes = smart_nframes(ele, total_frames=nframes, video_fps=video_fps)
 
-    indices = torch.linspace(0, nframes - 1, final_nframes).round().long()
-    frames_hwc = vr.get_batch(indices.tolist())
+    # NOTE: Use nframes - 2 instead of nframes - 1 to avoid EOF issues.
+    # Some videos have incomplete last frames that cause decord to fail with
+    # "Unable to handle EOF" error, especially on network storage or when
+    # running in multiprocess environments.
+    max_frame_idx = max(0, nframes - 2)
+    indices = torch.linspace(0, max_frame_idx, final_nframes).round().long()
+    indices_list = indices.tolist()
+
+    try:
+        frames_hwc = vr.get_batch(indices_list)
+    except Exception as e:
+        if "EOF" in str(e) or "Unable to handle" in str(e):
+            # Retry with more conservative indices (skip last 5 frames)
+            logger.warning(
+                f"EOF error when reading video, retrying with safer indices: {e}"
+            )
+            max_frame_idx = max(0, nframes - 6)
+            indices = torch.linspace(0, max_frame_idx, final_nframes).round().long()
+            indices_list = indices.tolist()
+            frames_hwc = vr.get_batch(indices_list)
+        else:
+            raise
 
     # Ensure torch tensor and convert to CHW
     if not isinstance(frames_hwc, torch.Tensor):
