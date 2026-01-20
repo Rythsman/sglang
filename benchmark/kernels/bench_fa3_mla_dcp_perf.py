@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import argparse
 import math
-import time
 from dataclasses import dataclass
-from typing import Callable, List, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -24,6 +23,13 @@ class BenchmarkConfig:
     dtype: torch.dtype
     sm_scale: float
     causal: bool
+
+
+def _flush_l2_cache() -> None:
+    # Use a reasonably large buffer to reduce L2 effects between iterations.
+    # This is a best-effort heuristic and is not guaranteed.
+    buf = torch.empty((256 * 1024 * 1024,), device="cuda", dtype=torch.uint8)
+    buf.zero_()
 
 
 def _parse_dtype(name: str) -> torch.dtype:
@@ -112,12 +118,15 @@ def _build_local_rank_inputs(
     ckv_cache_global: torch.Tensor,
     kpe_cache_global: torch.Tensor,
     rank: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     per_seq_indices, local_lens_cpu = _build_dcp_token_indices(
         kv_lens_cpu, cfg.dcp_size, rank
     )
     local_lens = local_lens_cpu.to(device=device, non_blocking=True)
     max_local = int(local_lens_cpu.max().item())
+    cu_seqlens_k_local = torch.nn.functional.pad(
+        torch.cumsum(local_lens, dim=0, dtype=torch.int32), (1, 0)
+    )
 
     local_ckv_chunks: List[torch.Tensor] = []
     local_kpe_chunks: List[torch.Tensor] = []
@@ -146,7 +155,13 @@ def _build_local_rank_inputs(
         if local_kpe_chunks
         else torch.empty((0, 1, cfg.head_dim_kpe), device=device, dtype=cfg.dtype)
     )
-    return local_lens, local_ckv_cache, local_kpe_cache, page_table_local
+    return (
+        local_lens,
+        cu_seqlens_k_local,
+        local_ckv_cache,
+        local_kpe_cache,
+        page_table_local,
+    )
 
 
 def _make_run_once(
@@ -163,7 +178,13 @@ def _make_run_once(
     # Pre-build per-rank compact caches and page tables.
     rank_inputs = []
     for rank in range(cfg.dcp_size):
-        local_lens, local_ckv, local_kpe, page_table_local = _build_local_rank_inputs(
+        (
+            local_lens,
+            cu_seqlens_k_local,
+            local_ckv,
+            local_kpe,
+            page_table_local,
+        ) = _build_local_rank_inputs(
             cfg,
             device,
             kv_lens_cpu,
@@ -171,10 +192,18 @@ def _make_run_once(
             kpe_cache_global,
             rank,
         )
-        rank_inputs.append((local_lens, local_ckv, local_kpe, page_table_local))
+        rank_inputs.append(
+            (local_lens, cu_seqlens_k_local, local_ckv, local_kpe, page_table_local)
+        )
 
     def _run_once() -> None:
-        for local_lens, local_ckv, local_kpe, page_table_local in rank_inputs:
+        for (
+            local_lens,
+            cu_seqlens_k_local,
+            local_ckv,
+            local_kpe,
+            page_table_local,
+        ) in rank_inputs:
             k_cache = local_kpe.view(-1, 1, 1, local_kpe.shape[-1])
             v_cache = local_ckv.view(-1, 1, 1, local_ckv.shape[-1])
             _ = flash_attn_with_kvcache(
@@ -185,9 +214,7 @@ def _make_run_once(
                 page_table=page_table_local,
                 cache_seqlens=local_lens,
                 cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=torch.nn.functional.pad(
-                    torch.cumsum(local_lens, dim=0, dtype=torch.int32), (1, 0)
-                ),
+                cu_seqlens_k_new=cu_seqlens_k_local,
                 max_seqlen_q=1,
                 softmax_scale=cfg.sm_scale,
                 causal=cfg.causal,
@@ -199,27 +226,65 @@ def _make_run_once(
 
 def _bench_gpu_time_ms(
     fn: Callable[[], None],
-    warmup_ms: int,
-    repeat_ms: int,
+    dry_run_time_ms: int,
+    repeat_time_ms: int,
+    l2_flush: bool,
+    use_cuda_graph: bool,
+    num_iters_within_graph: int,
 ) -> List[float]:
-    # Warmup for a target duration.
-    torch.cuda.synchronize()
-    t0 = time.time()
-    while (time.time() - t0) * 1000.0 < warmup_ms:
+    if num_iters_within_graph <= 0:
+        raise ValueError("num_iters_within_graph must be > 0")
+
+    # Warmup a bit to stabilize kernel selection / autotune.
+    for _ in range(5):
         fn()
     torch.cuda.synchronize()
 
-    times_ms: List[float] = []
+    run_fn: Callable[[], None]
+    iters_per_measure = 1
+
+    if use_cuda_graph:
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+
+        def _graph_body() -> None:
+            for _ in range(num_iters_within_graph):
+                fn()
+
+        with torch.cuda.graph(graph, stream=stream):
+            _graph_body()
+        torch.cuda.synchronize()
+
+        run_fn = graph.replay
+        iters_per_measure = num_iters_within_graph
+    else:
+        run_fn = fn
+        iters_per_measure = 1
+
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
-    t0 = time.time()
-    while (time.time() - t0) * 1000.0 < repeat_ms:
+    times_ms: List[float] = []
+
+    # Dry run: target duration in ms.
+    target_dry_iters = max(1, dry_run_time_ms // 5)
+    for _ in range(target_dry_iters):
+        if l2_flush:
+            _flush_l2_cache()
+        run_fn()
+    torch.cuda.synchronize()
+
+    # Measure for repeat_time_ms using event timing.
+    # We use a conservative upper bound on iterations to avoid a while+time loop.
+    max_meas_iters = max(1, repeat_time_ms // 2)
+    for _ in range(max_meas_iters):
+        if l2_flush:
+            _flush_l2_cache()
         start.record()
-        fn()
+        run_fn()
         end.record()
         end.synchronize()
-        times_ms.append(float(start.elapsed_time(end)))
+        times_ms.append(float(start.elapsed_time(end)) / float(iters_per_measure))
 
     return times_ms
 
@@ -247,8 +312,11 @@ def main() -> None:
     parser.add_argument("--return-lse", dest="return_lse", action="store_true")
     parser.add_argument("--no-return-lse", dest="return_lse", action="store_false", default=True)
     parser.add_argument("--causal", action="store_true", default=False)
-    parser.add_argument("--warmup-ms", type=int, default=200)
+    parser.add_argument("--dry-run-ms", type=int, default=200)
     parser.add_argument("--repeat-ms", type=int, default=1000)
+    parser.add_argument("--no-l2-flush", action="store_true", default=False)
+    parser.add_argument("--use-cuda-graph", action="store_true", default=False)
+    parser.add_argument("--num-iters-within-graph", type=int, default=10)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -296,7 +364,14 @@ def main() -> None:
     run_once()
     torch.cuda.synchronize()
 
-    times_ms = _bench_gpu_time_ms(run_once, warmup_ms=args.warmup_ms, repeat_ms=args.repeat_ms)
+    times_ms = _bench_gpu_time_ms(
+        run_once,
+        dry_run_time_ms=args.dry_run_ms,
+        repeat_time_ms=args.repeat_ms,
+        l2_flush=not args.no_l2_flush,
+        use_cuda_graph=args.use_cuda_graph,
+        num_iters_within_graph=args.num_iters_within_graph,
+    )
 
     num_local_heads = 128 // cfg.tp_size * cfg.dcp_size
     print(
@@ -305,6 +380,12 @@ def main() -> None:
         f"tp_size={cfg.tp_size}, dcp_size={cfg.dcp_size}, num_local_heads={num_local_heads}, "
         f"head_dim_ckv={cfg.head_dim_ckv}, head_dim_kpe={cfg.head_dim_kpe}, "
         f"page_size={cfg.page_size}, return_lse={args.return_lse}, causal={cfg.causal}"
+    )
+    print(
+        "Timing: "
+        f"use_cuda_graph={args.use_cuda_graph}, "
+        f"num_iters_within_graph={args.num_iters_within_graph}, "
+        f"l2_flush={not args.no_l2_flush}"
     )
     print(_stats_ms(times_ms))
 

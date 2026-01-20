@@ -8,6 +8,7 @@ from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.utils import compute_dcp_local_seq_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 class FlashAttentionMLADcpBackend(FlashAttentionBackend):
@@ -115,6 +116,158 @@ class FlashAttentionMLADcpBackend(FlashAttentionBackend):
         metadata.cu_seqlens_k = torch.nn.functional.pad(
             torch.cumsum(local_lens, dim=0, dtype=torch.int32), (1, 0)
         )
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info,
+    ):
+        """Initialize forward metadata for capturing CUDA graph.
+
+        Note: CUDA graph capture only targets decode for this backend.
+        """
+        assert (
+            forward_mode.is_decode_or_idle()
+        ), "DCP+MLA FA3 CUDA graph capture supports decode-only."
+        assert encoder_lens is None, "Encoder-decoder is not supported for DCP+MLA FA3."
+        assert spec_info is None, "Speculative decoding is not supported for DCP+MLA FA3."
+
+        super().init_forward_metadata_capture_cuda_graph(
+            bs=bs,
+            num_tokens=num_tokens,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+        )
+
+        # Localize metadata for the current DCP rank. Keep the same tensor objects
+        # (storage pointers) so the captured graph can be safely replayed.
+        metadata = self.forward_metadata
+        assert metadata is not None
+        assert metadata.cache_seqlens_int32 is not None
+        assert metadata.cu_seqlens_k is not None
+        assert metadata.page_table is not None
+
+        self._localize_decode_metadata_inplace_for_dcp(
+            metadata=metadata,
+            bs=bs,
+            req_pool_indices=req_pool_indices[:bs],
+            seq_lens=seq_lens[:bs],
+            seq_lens_cpu=None,
+        )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info,
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        """Initialize forward metadata for replaying CUDA graph."""
+        assert (
+            forward_mode.is_decode_or_idle()
+        ), "DCP+MLA FA3 CUDA graph replay supports decode-only."
+        assert encoder_lens is None, "Encoder-decoder is not supported for DCP+MLA FA3."
+        assert spec_info is None, "Speculative decoding is not supported for DCP+MLA FA3."
+        assert seq_lens_cpu is not None, "seq_lens_cpu is required for CUDA graph replay."
+
+        # Reuse the metadata object created during capture for this batch size.
+        metadata = self.decode_cuda_graph_metadata[bs]
+        self.forward_metadata = metadata
+
+        self._localize_decode_metadata_inplace_for_dcp(
+            metadata=metadata,
+            bs=bs,
+            req_pool_indices=req_pool_indices[:bs],
+            seq_lens=seq_lens[:bs],
+            seq_lens_cpu=seq_lens_cpu[:bs],
+        )
+
+    def _localize_decode_metadata_inplace_for_dcp(
+        self,
+        metadata,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+    ) -> None:
+        """Update decode metadata in-place for one DCP rank.
+
+        This method is used for both CUDA graph capture and replay. It keeps the
+        same output tensors (page table, cache_seqlens, cu_seqlens_k) and only
+        updates their contents.
+
+        Args:
+            metadata: FlashAttentionMetadata.
+            bs: Batch size.
+            req_pool_indices: Shape [bs], CUDA int tensor.
+            seq_lens: Shape [bs], CUDA int tensor.
+            seq_lens_cpu: Optional CPU view of seq_lens (used to compute max length
+                without a device sync). If None, will fall back to a device query.
+        """
+        if bs <= 0:
+            metadata.max_seq_len_k = 0
+            return
+
+        # (1) Compute local lengths and cu_seqlens_k.
+        local_lens = compute_dcp_local_seq_lens(
+            seq_lens, self._dcp_rank, self._dcp_world_size
+        )
+        metadata.cache_seqlens_int32.copy_(local_lens)
+        metadata.cu_seqlens_k[0] = 0
+        metadata.cu_seqlens_k[1:].copy_(
+            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+        )
+
+        max_local_k = int(local_lens.max().item())
+        metadata.max_seq_len_k = max_local_k
+
+        # (2) Gather global token indices (page_size == 1) without mutating
+        # cache_seqlens / cu_seqlens_k.
+        max_len = (
+            int(seq_lens_cpu.max().item())
+            if seq_lens_cpu is not None
+            else int(seq_lens.max().item())
+        )
+        max_len = max(0, max_len)
+        if max_len == 0 or max_local_k == 0:
+            # Keep page_table contents unspecified; kernels won't read out of range.
+            return
+
+        strided_indices = self.decode_cuda_graph_metadata["strided_indices"][:max_len]
+        global_tokens = self.req_to_token[
+            req_pool_indices[:, None],
+            strided_indices[None, :],
+        ]
+
+        # (3) Filter and localize tokens: keep idx % world == rank, map to idx // world,
+        # and compact each row to the left into metadata.page_table.
+        # Make sure we compute positions on int64 to avoid overflow on long contexts.
+        tokens_i64 = global_tokens.to(torch.int64)
+        mask = (tokens_i64 % self._dcp_world_size) == self._dcp_rank
+        pos = mask.to(torch.int32).cumsum(dim=1) - 1  # valid only where mask==True
+        local_tokens = (tokens_i64 // self._dcp_world_size).to(torch.int32)
+
+        # Clear only the prefix that the kernel may read.
+        metadata.page_table[:, :max_local_k].zero_()
+
+        # Scatter compacted tokens.
+        b_idx = torch.arange(bs, device=global_tokens.device, dtype=torch.int64).view(
+            -1, 1
+        )
+        b_idx = b_idx.expand_as(pos)
+        metadata.page_table[b_idx[mask], pos[mask].to(torch.int64)] = local_tokens[mask]
 
     def forward_decode(
         self,
